@@ -1,5 +1,7 @@
 # pk2
 
+[![CI](https://github.com/mahmoudfarouq/pk2/actions/workflows/ci.yml/badge.svg)](https://github.com/mahmoudfarouq/pk2/actions/workflows/ci.yml)
+
 A Rust library for reading and modifying Silkroad Online PK2 archives.
 
 ```rust
@@ -36,4 +38,17 @@ one — `Media.pk2` itself is copyrighted client data and is not redistributable
 ```bash
 cargo install --git https://github.com/Veykril/pk2 pk2_mate
 pk2_mate pack -d ./testdata -a test.pk2 -k 169841
+```
+
+## Development
+
+CI runs on Linux, macOS and Windows. To reproduce it locally:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo test --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+python3 scripts/check-doc-links.py docs README.md
 ```
