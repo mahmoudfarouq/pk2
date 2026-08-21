@@ -64,3 +64,12 @@ cargo test --all-targets
 cargo test --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 ```
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you shall be dual licensed as above, without any
+additional terms or conditions.
