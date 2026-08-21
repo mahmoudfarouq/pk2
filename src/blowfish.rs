@@ -11,7 +11,25 @@ const PBOX_ENTRIES: usize = 18;
 /// Number of entries per S-box.
 const SBOX_ENTRIES: usize = 256;
 /// Blowfish accepts keys of 1 to 56 bytes.
-const MAX_KEY_LENGTH: usize = 56;
+pub const MAX_KEY_LENGTH: usize = 56;
+
+/// The salt PK2 folds into a key before using it.
+///
+/// Ten bytes, conceptually zero-extended: a key longer than this passes its
+/// tail through unchanged. See `docs/encryption.md`.
+const PK2_SALT: [u8; 10] = [0x03, 0xF8, 0xE4, 0x44, 0x88, 0x99, 0x3F, 0x64, 0xFE, 0x35];
+
+/// Turn a user-facing ASCII key into the Blowfish key PK2 actually uses.
+///
+/// `169841`, the international Silkroad key, derives to
+/// `32 CE DD 7C BC A8`.
+pub fn derive_key(ascii_key: &[u8]) -> Vec<u8> {
+    ascii_key
+        .iter()
+        .enumerate()
+        .map(|(i, byte)| byte ^ PK2_SALT.get(i).copied().unwrap_or(0))
+        .collect()
+}
 
 const PBOX_INIT: [u32; 18] = [
     0x243f6a88, 0x85a308d3, 0x13198a2e, 0x3707344, 0xa4093822, 0x299f31d0, 0x82efa98, 0xec4e6c89,
@@ -168,26 +186,30 @@ pub struct BlowFish {
 impl BlowFish {
     /// Build a cipher from an already-derived Blowfish key.
     ///
-    /// PK2 salts its ASCII key before use; this constructor expects the
-    /// *derived* key, not the ASCII one. See `docs/encryption.md`.
+    /// PK2 salts its ASCII key before use, so this expects the *derived* key.
+    /// Use [`BlowFish::from_ascii_key`] to derive one.
     ///
-    /// # Panics
-    ///
-    /// Panics if `key` is empty or longer than 56 bytes.
-    pub fn new(key: &[u8]) -> Self {
-        assert!(
-            !key.is_empty() && key.len() <= MAX_KEY_LENGTH,
-            "blowfish key must be 1..={} bytes, got {}",
-            MAX_KEY_LENGTH,
-            key.len()
-        );
+    /// Returns `None` if the key is empty or longer than
+    /// [`MAX_KEY_LENGTH`] bytes.
+    pub fn new(key: &[u8]) -> Option<Self> {
+        if key.is_empty() || key.len() > MAX_KEY_LENGTH {
+            return None;
+        }
 
         let mut this = Self {
             pbox: PBOX_INIT,
             sbox: [SBOX_INIT_1, SBOX_INIT_2, SBOX_INIT_3, SBOX_INIT_4],
         };
         this.expand_key(key);
-        this
+        Some(this)
+    }
+
+    /// Build a cipher from a user-facing ASCII key, applying PK2's salt.
+    ///
+    /// Returns `None` if the key is empty or longer than
+    /// [`MAX_KEY_LENGTH`] bytes.
+    pub fn from_ascii_key(ascii_key: &[u8]) -> Option<Self> {
+        Self::new(&derive_key(ascii_key))
     }
 
     /// The standard Blowfish key schedule: fold the key into the P-array, then
@@ -309,14 +331,14 @@ mod tests {
     #[test]
     fn encrypt_matches_known_vector() {
         let mut data = plaintext();
-        BlowFish::new(KEY).encrypt(&mut data);
+        BlowFish::new(KEY).unwrap().encrypt(&mut data);
         assert_eq!(data, CIPHERTEXT.to_vec());
     }
 
     #[test]
     fn decrypt_matches_known_vector() {
         let mut data = CIPHERTEXT.to_vec();
-        BlowFish::new(KEY).decrypt(&mut data);
+        BlowFish::new(KEY).unwrap().decrypt(&mut data);
         assert_eq!(data, plaintext());
     }
 
@@ -324,7 +346,7 @@ mod tests {
     fn round_trips_a_full_block() {
         // 2560 bytes: one whole PK2 index block.
         let original: Vec<u8> = (0..2560).map(|i| (i % 251) as u8).collect();
-        let blowfish = BlowFish::new(KEY);
+        let blowfish = BlowFish::new(KEY).unwrap();
 
         let mut data = original.clone();
         blowfish.encrypt(&mut data);
@@ -337,7 +359,7 @@ mod tests {
     fn decrypting_per_entry_matches_decrypting_the_whole_block() {
         // ECB has no inter-unit state, so 128-byte and 2560-byte granularity
         // must agree. docs/file-format.md relies on this.
-        let blowfish = BlowFish::new(KEY);
+        let blowfish = BlowFish::new(KEY).unwrap();
         let mut whole: Vec<u8> = (0..2560).map(|i| (i % 97) as u8).collect();
         let mut piecewise = whole.clone();
 
@@ -351,7 +373,7 @@ mod tests {
 
     #[test]
     fn trailing_partial_unit_is_left_alone() {
-        let blowfish = BlowFish::new(KEY);
+        let blowfish = BlowFish::new(KEY).unwrap();
         let mut data = vec![7u8; 12];
         blowfish.encrypt(&mut data);
         assert_eq!(
@@ -362,8 +384,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "blowfish key")]
-    fn rejects_an_empty_key() {
-        BlowFish::new(&[]);
+    fn rejects_keys_of_invalid_length() {
+        assert!(BlowFish::new(&[]).is_none(), "empty key");
+        assert!(BlowFish::new(&[0u8; 57]).is_none(), "57 bytes is too long");
+        assert!(
+            BlowFish::new(&[0u8; 56]).is_some(),
+            "56 bytes is the maximum"
+        );
+        assert!(BlowFish::new(&[0u8; 1]).is_some(), "one byte is allowed");
+    }
+
+    #[test]
+    fn derives_the_international_key() {
+        // The salt-XOR of the ASCII key "169841" is the constant every tool
+        // hardcodes. docs/encryption.md documents this.
+        assert_eq!(super::derive_key(b"169841"), KEY.to_vec());
+    }
+
+    #[test]
+    fn derivation_passes_through_bytes_beyond_the_salt() {
+        // PK2_SALT is 10 bytes and is zero-extended past that.
+        let key = [0xAAu8; 16];
+        let derived = super::derive_key(&key);
+        assert_eq!(&derived[10..], &key[10..], "tail is unchanged");
+        assert_ne!(&derived[..10], &key[..10], "head is salted");
+    }
+
+    #[test]
+    fn ascii_key_constructor_matches_manual_derivation() {
+        let mut a = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut b = a.clone();
+        BlowFish::from_ascii_key(b"169841").unwrap().encrypt(&mut a);
+        BlowFish::new(KEY).unwrap().encrypt(&mut b);
+        assert_eq!(a, b);
     }
 }

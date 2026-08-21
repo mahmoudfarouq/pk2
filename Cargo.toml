@@ -3,10 +3,21 @@ name = "pk2"
 version = "0.1.0"
 authors = ["mahmoudFarouk <mahmoud.farouk987@gmail.com>"]
 edition = "2024"
+# slice::as_chunks is the newest std API in use; verified by the msrv CI job.
+rust-version = "1.88"
 description = "Read and modify Silkroad Online PK2 archives"
 repository = "https://github.com/mahmoudfarouq/pk2"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["pk2", "silkroad", "archive"]
 categories = ["filesystem", "parser-implementations"]
 
+[features]
+default = ["euc-kr"]
+# Decode filenames as EUC-KR, which is what original Joymax archives use.
+# Without it, names fall back to lossy UTF-8 and Korean names come back as
+# replacement characters.
+euc-kr = ["dep:encoding_rs"]
+
 [dependencies]
+encoding_rs = { version = "0.8.35", optional = true }

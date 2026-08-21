@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), pk2::Error> {
-//! let archive = pk2::Extractor::open("Media.pk2")?;
+//! let archive = pk2::Archive::open("Media.pk2")?;
 //!
 //! for entry in archive.list("server_dep/silkroad/textdata")? {
 //!     println!("{}", entry);
@@ -18,6 +18,7 @@
 //! # }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::error;
 use std::fmt;
@@ -26,17 +27,17 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod blowfish;
+mod header;
 
 use crate::blowfish::BlowFish;
+use crate::header::{HEADER_SIZE, Header};
 
 // ---------------------------------------------------------------------------
 // Format constants. See docs/file-format.md §9.
 // ---------------------------------------------------------------------------
 
-/// Size of the archive header. The root block begins immediately after it.
-const HEADER_SIZE: u64 = 256;
 /// Offset of the first block of the root chain.
-const ROOT_BLOCK_OFFSET: u64 = HEADER_SIZE;
+const ROOT_BLOCK_OFFSET: u64 = HEADER_SIZE as u64;
 /// Every entry occupies exactly 128 bytes.
 const ENTRY_SIZE: usize = 128;
 /// Every block holds exactly 20 entries, no more and no fewer.
@@ -56,11 +57,11 @@ const OFF_SIZE: usize = 0x72;
 const OFF_NEXT_BLOCK: usize = 0x76;
 const OFF_PADDING: usize = 0x7E;
 
-/// Blowfish key for international Silkroad archives.
+/// The key international Silkroad archives are packed with.
 ///
-/// This is the ASCII key `169841` *after* PK2's salt-XOR derivation. Archives
-/// packed with any other key will not decrypt; see `docs/encryption.md`.
-const DEFAULT_KEY: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
+/// This is the ASCII key, not the derived one — see `docs/encryption.md` for
+/// the salt-XOR that turns it into Blowfish key material.
+pub const DEFAULT_KEY: &[u8] = b"169841";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -86,6 +87,14 @@ pub enum Error {
     NotAFile(String),
     /// A payload longer than `u32::MAX`, which the `size` field cannot express.
     FileTooLarge(usize),
+    /// The file does not begin with the PK2 signature.
+    NotAnArchive,
+    /// The header records a version this crate does not understand.
+    UnsupportedVersion(u32),
+    /// The header's checksum does not match the key supplied.
+    InvalidKey,
+    /// A key Blowfish cannot accept: empty, or longer than 56 bytes.
+    InvalidKeyLength(usize),
 }
 
 /// Shorthand for this crate's result type.
@@ -111,6 +120,14 @@ impl fmt::Display for Error {
                 "payload of {} bytes exceeds the 4 GiB maximum the size field can express",
                 len
             ),
+            Error::NotAnArchive => write!(f, "not a pk2 archive: signature does not match"),
+            Error::UnsupportedVersion(version) => {
+                write!(f, "unsupported archive version {:#010x}", version)
+            }
+            Error::InvalidKey => write!(f, "wrong key: the archive's checksum does not match"),
+            Error::InvalidKeyLength(len) => {
+                write!(f, "key of {} bytes; must be 1 to 56 bytes", len)
+            }
         }
     }
 }
@@ -195,12 +212,13 @@ impl Entry {
         self.kind
     }
 
-    /// The entry's name, decoded lossily.
+    /// The entry's name.
     ///
-    /// Original Joymax archives store names in EUC-KR, which this does not yet
-    /// decode; non-ASCII names come back with replacement characters.
+    /// Decoded as EUC-KR, which is what original Joymax archives use. Without
+    /// the `euc-kr` feature this falls back to lossy UTF-8, and Korean names
+    /// come back as replacement characters.
     pub fn name(&self) -> String {
-        String::from_utf8_lossy(self.raw_name()).into_owned()
+        decode_name(self.raw_name())
     }
 
     /// For a file, the offset of its payload. For a directory, the head of its
@@ -243,6 +261,51 @@ impl Entry {
     fn is_self_or_parent(&self) -> bool {
         let name = self.raw_name();
         name == &b"."[..] || name == &b".."[..]
+    }
+
+    /// An unused slot.
+    fn empty() -> Self {
+        Self {
+            offset: 0,
+            kind: EntryKind::Empty,
+            name: [0; NAME_BYTES],
+            access_date: 0,
+            create_date: 0,
+            modify_date: 0,
+            position: 0,
+            size: 0,
+            next_block: 0,
+            padding: [0, 0],
+        }
+    }
+
+    /// A directory entry named `name`, pointing at `children_chain`.
+    ///
+    /// Used to synthesise the `.` and `..` links when writing a chain.
+    fn new_directory(name: &[u8], children_chain: u64) -> Self {
+        let mut raw_name = [0u8; NAME_BYTES];
+        let len = name.len().min(NAME_BYTES - 1);
+        raw_name[..len].copy_from_slice(&name[..len]);
+
+        Self {
+            kind: EntryKind::Directory,
+            name: raw_name,
+            position: children_chain,
+            ..Self::empty()
+        }
+    }
+
+    /// This entry pointing at `position` instead, with its chain link cleared.
+    ///
+    /// Name, kind, size and timestamps carry over verbatim, so a repack
+    /// preserves them byte for byte.
+    fn relocated(&self, position: u64) -> Self {
+        Self {
+            offset: 0,
+            position,
+            next_block: 0,
+            ..*self
+        }
     }
 
     fn from_bytes(raw: &[u8], offset: u64) -> Result<Self> {
@@ -308,25 +371,75 @@ impl fmt::Display for Entry {
 // ---------------------------------------------------------------------------
 
 /// An open PK2 archive.
-pub struct Extractor {
+///
+/// Opened read-only for listing and extracting; [`Archive::patch`] writes
+/// through its own handle.
+pub struct Archive {
     path: PathBuf,
-    blowfish: BlowFish,
+    /// One read handle for the archive's lifetime.
+    ///
+    /// Reads are a seek plus a `read_exact`, so nothing is buffered here and a
+    /// separate write handle opened by [`Archive::patch`] stays coherent
+    /// with it. Opened read-only, so read-only archives can be listed.
+    ///
+    /// `RefCell` rather than a lock: seeking mutates the handle, and the read
+    /// methods take `&self`. This makes `Archive` `!Sync`.
+    file: RefCell<File>,
+    /// `None` when the header says the index is stored in the clear.
+    cipher: Option<BlowFish>,
     root: Entry,
 }
 
-impl Extractor {
-    /// Open an archive.
+impl Archive {
+    /// Open an archive packed with the default international key.
     ///
-    /// Reads the root entry immediately, so a missing file or an undecryptable
-    /// index fails here rather than on first use.
+    /// Equivalent to [`Archive::open_with_key`] with [`DEFAULT_KEY`].
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_key(path, DEFAULT_KEY)
+    }
+
+    /// Open an archive packed with `ascii_key`.
+    ///
+    /// The key is the user-facing ASCII one, such as `b"169841"`; the salt-XOR
+    /// derivation is applied internally.
+    ///
+    /// Validates the header before touching the index, so a file that is not
+    /// an archive, is an unknown version, or was packed with a different key
+    /// fails here with a clear error rather than decrypting to noise.
+    pub fn open_with_key<P: AsRef<Path>>(path: P, ascii_key: &[u8]) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let blowfish = BlowFish::new(DEFAULT_KEY);
-        let root = read_entry_at(&path, &blowfish, ROOT_BLOCK_OFFSET)?;
+
+        let file = RefCell::new(File::open(&path)?);
+
+        let raw: [u8; HEADER_SIZE] = read_at(&file, 0, HEADER_SIZE)?
+            .try_into()
+            .expect("read_at returns the requested length");
+        let header = Header::parse(&raw);
+
+        if !header.has_valid_signature() {
+            return Err(Error::NotAnArchive);
+        }
+        if !header.is_supported_version() {
+            return Err(Error::UnsupportedVersion(header.version()));
+        }
+
+        let cipher = if header.is_encrypted() {
+            let blowfish = BlowFish::from_ascii_key(ascii_key)
+                .ok_or(Error::InvalidKeyLength(ascii_key.len()))?;
+            if !header.key_matches(&blowfish) {
+                return Err(Error::InvalidKey);
+            }
+            Some(blowfish)
+        } else {
+            None
+        };
+
+        let root = read_entry_at(&file, cipher.as_ref(), ROOT_BLOCK_OFFSET)?;
 
         Ok(Self {
             path,
-            blowfish,
+            file,
+            cipher,
             root,
         })
     }
@@ -375,7 +488,7 @@ impl Extractor {
         if !entry.is_file() {
             return Err(Error::NotAFile(path.to_string()));
         }
-        Ok(read_at(&self.path, entry.position, entry.size as usize)?)
+        Ok(read_at(&self.file, entry.position, entry.size as usize)?)
     }
 
     /// Replace a file's contents.
@@ -398,9 +511,119 @@ impl Extractor {
         entry.size = data.len() as u32;
 
         let mut encoded = entry.to_bytes();
-        self.blowfish.encrypt(&mut encoded);
+        if let Some(cipher) = &self.cipher {
+            cipher.encrypt(&mut encoded);
+        }
         write_at(&self.path, entry.offset, &encoded)?;
 
+        Ok(())
+    }
+
+    /// Write a defragmented copy of this archive to `dest`.
+    ///
+    /// [`Archive::patch`] appends the new payload and orphans the old one, so a
+    /// repeatedly patched archive carries dead weight the format has no free
+    /// list to reclaim. Repacking walks the tree and writes only reachable
+    /// data, rebuilding block chains compactly.
+    ///
+    /// The copy keeps the source's encryption state and key, and preserves
+    /// names, sizes and timestamps verbatim.
+    ///
+    /// Fails if `dest` already exists, rather than truncating it.
+    pub fn repack<P: AsRef<Path>>(&self, dest: P) -> Result<()> {
+        let mut plan = self.plan()?;
+        let payloads = assign_offsets(&mut plan);
+        self.write_repacked(dest.as_ref(), &plan, &payloads)
+    }
+
+    /// Walk the tree, breadth first, into one `PlannedDir` per directory.
+    fn plan(&self) -> Result<Vec<PlannedDir>> {
+        let mut plan = vec![PlannedDir::new(None)];
+
+        // Aliased chains would make the walk recurse for ever, so a repack of
+        // a structurally broken archive fails rather than looping.
+        let mut visited = HashSet::new();
+        visited.insert(self.root.position);
+
+        let mut queue = vec![(0usize, self.root)];
+        while let Some((index, entry)) = queue.pop() {
+            for child in self.children(&entry)? {
+                match child.kind {
+                    EntryKind::File => plan[index].files.push(child),
+                    EntryKind::Directory => {
+                        if !visited.insert(child.position) {
+                            return Err(Error::ChainCycle(child.position));
+                        }
+                        let child_index = plan.len();
+                        plan.push(PlannedDir::new(Some(child)));
+                        plan[index].subdirs.push(child_index);
+                        queue.push((child_index, child));
+                    }
+                    EntryKind::Empty => {}
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn write_repacked(
+        &self,
+        dest: &Path,
+        plan: &[PlannedDir],
+        payloads: &[Vec<u64>],
+    ) -> Result<()> {
+        let mut out = OpenOptions::new().write(true).create_new(true).open(dest)?;
+
+        out.write_all(&Header::new(self.cipher.as_ref()).to_bytes())?;
+
+        for (dir, offsets) in plan.iter().zip(payloads) {
+            let blocks = dir.blocks();
+            let mut entries = Vec::with_capacity(blocks * BLOCK_ENTRY_COUNT);
+
+            entries.push(Entry::new_directory(b".", dir.chain));
+            entries.push(Entry::new_directory(b"..", dir.parent_chain));
+
+            for &child in &dir.subdirs {
+                let source = plan[child].source.expect("only the root has no source");
+                entries.push(source.relocated(plan[child].chain));
+            }
+            for (file, &offset) in dir.files.iter().zip(offsets) {
+                entries.push(file.relocated(offset));
+            }
+            entries.resize(blocks * BLOCK_ENTRY_COUNT, Entry::empty());
+
+            // Link the blocks: the final entry of every block but the last
+            // points at the block that follows it.
+            for block in 0..blocks - 1 {
+                let last = block * BLOCK_ENTRY_COUNT + BLOCK_ENTRY_COUNT - 1;
+                entries[last].next_block = dir.chain + ((block + 1) * BLOCK_SIZE) as u64;
+            }
+
+            for block in entries.chunks(BLOCK_ENTRY_COUNT) {
+                let mut raw: Vec<u8> = block.iter().flat_map(|entry| entry.to_bytes()).collect();
+                debug_assert_eq!(raw.len(), BLOCK_SIZE);
+                if let Some(cipher) = &self.cipher {
+                    cipher.encrypt(&mut raw);
+                }
+                out.write_all(&raw)?;
+            }
+        }
+
+        let position = out.stream_position()?;
+        if let Some(&first) = payloads.iter().flatten().next() {
+            debug_assert_eq!(position, first, "payloads must start where layout said");
+        }
+
+        let mut source = self.file.borrow_mut();
+        for (dir, offsets) in plan.iter().zip(payloads) {
+            for file in dir.files.iter() {
+                copy_range(&mut source, &mut out, file.position, file.size)?;
+            }
+            debug_assert_eq!(dir.files.len(), offsets.len());
+        }
+
+        out.flush()?;
         Ok(())
     }
 
@@ -452,18 +675,122 @@ impl Extractor {
     }
 
     fn read_block(&self, offset: u64) -> Result<Vec<Entry>> {
-        read_block_at(&self.path, &self.blowfish, offset)
+        read_block_at(&self.file, self.cipher.as_ref(), offset)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repack planning
+// ---------------------------------------------------------------------------
+
+/// How much of a payload to move at a time.
+const COPY_CHUNK: usize = 64 * 1024;
+
+/// One directory in a repack, with offsets filled in by [`assign_offsets`].
+struct PlannedDir {
+    /// The source entry, or `None` for the root, which has none.
+    source: Option<Entry>,
+    files: Vec<Entry>,
+    /// Indices into the plan.
+    subdirs: Vec<usize>,
+    /// Offset of this directory's first block.
+    chain: u64,
+    /// Offset of the parent's first block. The root's points at itself.
+    parent_chain: u64,
+}
+
+impl PlannedDir {
+    fn new(source: Option<Entry>) -> Self {
+        Self {
+            source,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+            chain: 0,
+            parent_chain: 0,
+        }
+    }
+
+    /// Slots needed, including the `.` and `..` links.
+    fn slots(&self) -> usize {
+        2 + self.files.len() + self.subdirs.len()
+    }
+
+    /// Blocks needed to hold those slots. Never zero: a chain always has at
+    /// least one block, because it always has `.` and `..`.
+    fn blocks(&self) -> usize {
+        self.slots().div_ceil(BLOCK_ENTRY_COUNT).max(1)
+    }
+}
+
+/// Lay out the plan: every directory's chain offset, every parent link, and
+/// every payload offset.
+///
+/// Returns the payload offsets, parallel to each directory's `files`.
+fn assign_offsets(plan: &mut [PlannedDir]) -> Vec<Vec<u64>> {
+    let mut cursor = ROOT_BLOCK_OFFSET;
+    for dir in plan.iter_mut() {
+        dir.chain = cursor;
+        cursor += (dir.blocks() * BLOCK_SIZE) as u64;
+    }
+
+    // The root is its own parent, matching what other writers emit.
+    plan[0].parent_chain = plan[0].chain;
+    for index in 0..plan.len() {
+        let parent_chain = plan[index].chain;
+        for child in plan[index].subdirs.clone() {
+            plan[child].parent_chain = parent_chain;
+        }
+    }
+
+    // Payloads follow every block, in plan order.
+    plan.iter()
+        .map(|dir| {
+            dir.files
+                .iter()
+                .map(|file| {
+                    let offset = cursor;
+                    cursor += u64::from(file.size);
+                    offset
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Copy `len` bytes from `from` in `src` to the current position in `dest`.
+fn copy_range(src: &mut File, dest: &mut File, from: u64, len: u32) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    src.seek(SeekFrom::Start(from))?;
+
+    let mut remaining = len as usize;
+    let mut buffer = vec![0u8; remaining.min(COPY_CHUNK)];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len());
+        src.read_exact(&mut buffer[..take])?;
+        dest.write_all(&buffer[..take])?;
+        remaining -= take;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Reading and writing
 // ---------------------------------------------------------------------------
 
-/// Read and decrypt the 20 entries of the block at `offset`.
-fn read_block_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Vec<Entry>> {
-    let mut raw = read_at(path, offset, BLOCK_SIZE)?;
-    blowfish.decrypt(&mut raw);
+/// Read the 20 entries of the block at `offset`, decrypting if needed.
+fn read_block_at(
+    file: &RefCell<File>,
+    cipher: Option<&BlowFish>,
+    offset: u64,
+) -> Result<Vec<Entry>> {
+    let mut raw = read_at(file, offset, BLOCK_SIZE)?;
+    if let Some(cipher) = cipher {
+        cipher.decrypt(&mut raw);
+    }
 
     let (entries, _remainder) = raw.as_chunks::<ENTRY_SIZE>();
     entries
@@ -473,15 +800,18 @@ fn read_block_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Vec<En
         .collect()
 }
 
-/// Read and decrypt the single entry at `offset`.
-fn read_entry_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Entry> {
-    let mut raw = read_at(path, offset, ENTRY_SIZE)?;
-    blowfish.decrypt(&mut raw);
+/// Read the single entry at `offset`, decrypting if needed.
+fn read_entry_at(file: &RefCell<File>, cipher: Option<&BlowFish>, offset: u64) -> Result<Entry> {
+    let mut raw = read_at(file, offset, ENTRY_SIZE)?;
+    if let Some(cipher) = cipher {
+        cipher.decrypt(&mut raw);
+    }
     Entry::from_bytes(&raw, offset)
 }
 
-fn read_at(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+/// Read `len` bytes at `offset` through the archive's shared handle.
+fn read_at(file: &RefCell<File>, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut file = file.borrow_mut();
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; len];
     file.read_exact(&mut buffer)?;
@@ -508,6 +838,23 @@ fn append(path: &Path, data: &[u8]) -> io::Result<u64> {
 fn split_path(path: &str) -> impl Iterator<Item = &str> + '_ {
     path.split(['/', '\\'])
         .filter(|component| !component.is_empty() && *component != ".")
+}
+
+/// Decode a name field's bytes.
+///
+/// EUC-KR is ASCII-compatible, so ASCII names decode identically either way.
+fn decode_name(raw: &[u8]) -> String {
+    #[cfg(feature = "euc-kr")]
+    {
+        encoding_rs::EUC_KR
+            .decode_without_bom_handling(raw)
+            .0
+            .into_owned()
+    }
+    #[cfg(not(feature = "euc-kr"))]
+    {
+        String::from_utf8_lossy(raw).into_owned()
+    }
 }
 
 fn read_u64(raw: &[u8], at: usize) -> u64 {
@@ -544,8 +891,8 @@ mod tests {
             TempArchive { path }
         }
 
-        fn open(&self) -> Extractor {
-            Extractor::open(&self.path).expect("open the fixture")
+        fn open(&self) -> Archive {
+            Archive::open(&self.path).expect("open the fixture")
         }
     }
 
@@ -582,12 +929,29 @@ mod tests {
         vec![0u8; ENTRY_SIZE]
     }
 
+    fn cipher() -> BlowFish {
+        BlowFish::from_ascii_key(DEFAULT_KEY).expect("default key is valid")
+    }
+
+    /// A valid 256-byte header for an encrypted archive.
+    fn valid_header() -> Vec<u8> {
+        Header::new(Some(&cipher())).to_bytes()
+    }
+
     /// Assemble up to 19 entries into one encrypted 2560-byte block.
     ///
     /// Entry 19 is deliberately left *empty* while still carrying `next_block`.
     /// That is legal per the format and is precisely the shape a walker that
     /// stops at the first empty entry gets wrong.
-    fn block(mut entries: Vec<Vec<u8>>, next_block: u64) -> Vec<u8> {
+    fn block(entries: Vec<Vec<u8>>, next_block: u64) -> Vec<u8> {
+        block_with(entries, next_block, Some(&cipher()))
+    }
+
+    fn block_with(
+        mut entries: Vec<Vec<u8>>,
+        next_block: u64,
+        cipher: Option<&BlowFish>,
+    ) -> Vec<u8> {
         assert!(
             entries.len() < BLOCK_ENTRY_COUNT,
             "entry 19 is reserved for the chain pointer"
@@ -602,7 +966,9 @@ mod tests {
 
         let mut raw: Vec<u8> = entries.concat();
         assert_eq!(raw.len(), BLOCK_SIZE);
-        BlowFish::new(DEFAULT_KEY).encrypt(&mut raw);
+        if let Some(cipher) = cipher {
+            cipher.encrypt(&mut raw);
+        }
         raw
     }
 
@@ -616,7 +982,7 @@ mod tests {
     /// `BLOCK_1` holds a hole between real entries, and `BLOCK_0`'s chain
     /// pointer lives in an empty entry 19.
     fn chained_archive() -> Vec<u8> {
-        let mut out = vec![0u8; HEADER_SIZE as usize];
+        let mut out = valid_header();
 
         out.extend(block(
             vec![
@@ -661,6 +1027,308 @@ mod tests {
         names
     }
 
+    /// A path in the temp directory that is removed on drop.
+    struct TempPath {
+        path: PathBuf,
+    }
+
+    impl TempPath {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("pk2-dest-{name}.pk2"));
+            let _ = std::fs::remove_file(&path);
+            TempPath { path }
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A root directory holding 25 files, so its chain spans two blocks.
+    ///
+    /// Block 0 carries `.`, `..` and 17 files; block 1 carries the other 8.
+    fn wide_archive() -> Vec<u8> {
+        let mut out = valid_header();
+
+        let first: Vec<Vec<u8>> = std::iter::once(dir(".", BLOCK_0))
+            .chain(std::iter::once(dir("..", BLOCK_0)))
+            .chain((0..17).map(|i| file(&format!("f{i:02}.txt"), DATA, 5)))
+            .collect();
+        out.extend(block(first, BLOCK_1));
+
+        let second: Vec<Vec<u8>> = (17..25)
+            .map(|i| file(&format!("f{i:02}.txt"), DATA, 5))
+            .collect();
+        out.extend(block(second, 0));
+
+        // DATA is defined relative to three blocks, so pad to reach it.
+        out.resize(DATA as usize, 0);
+        out.extend_from_slice(b"hello");
+        out
+    }
+
+    // --- repack ------------------------------------------------------------
+
+    #[test]
+    fn repack_preserves_the_tree() {
+        let archive = TempArchive::new("repacksrc", &chained_archive());
+        let dest = TempPath::new("repacktree");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        assert_eq!(
+            sorted_names(&repacked.list(".").expect("list root")),
+            vec!["alpha.txt", "beta.txt", "delta.txt", "gamma.txt", "sub"]
+        );
+        assert_eq!(
+            names(&repacked.list("sub").expect("list sub")),
+            vec!["inner.txt"]
+        );
+    }
+
+    #[test]
+    fn repack_preserves_payloads() {
+        let archive = TempArchive::new("repackdata", &chained_archive());
+        let dest = TempPath::new("repackdata");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        for path in [
+            "alpha.txt",
+            "beta.txt",
+            "gamma.txt",
+            "delta.txt",
+            "sub/inner.txt",
+        ] {
+            assert_eq!(
+                repacked.extract(path).expect(path),
+                b"hello".to_vec(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn repack_rebuilds_multi_block_chains() {
+        // 25 files cannot fit one block, so the writer must chain.
+        let archive = TempArchive::new("repackwide", &wide_archive());
+        let dest = TempPath::new("repackwide");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        let listed = repacked.list(".").expect("list");
+        assert_eq!(listed.len(), 25, "got {:?}", sorted_names(&listed));
+        assert_eq!(
+            repacked.extract("f24.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_reclaims_orphaned_payloads() {
+        let archive = TempArchive::new("repackshrink", &chained_archive());
+
+        // Patching appends and orphans the old payload, repeatedly.
+        let opened = archive.open();
+        for _ in 0..16 {
+            opened.patch("alpha.txt", &[0xAB; 4096]).expect("patch");
+        }
+        drop(opened);
+
+        let patched_len = std::fs::metadata(&archive.path).expect("stat").len();
+        let dest = TempPath::new("repackshrink");
+        archive.open().repack(&dest.path).expect("repack");
+        let repacked_len = std::fs::metadata(&dest.path).expect("stat").len();
+
+        assert!(
+            repacked_len < patched_len,
+            "repack should shrink: {patched_len} -> {repacked_len}"
+        );
+        assert_eq!(
+            Archive::open(&dest.path)
+                .expect("open")
+                .extract("alpha.txt")
+                .expect("extract"),
+            vec![0xAB; 4096],
+            "the live payload must survive"
+        );
+    }
+
+    #[test]
+    fn repack_refuses_to_overwrite() {
+        let archive = TempArchive::new("repacknoclobber", &chained_archive());
+        let dest = TempPath::new("repacknoclobber");
+        std::fs::write(&dest.path, b"do not clobber me").expect("write");
+
+        assert!(matches!(
+            archive.open().repack(&dest.path),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            std::fs::read(&dest.path).expect("read"),
+            b"do not clobber me".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_keeps_a_plaintext_index_plaintext() {
+        let mut header = Header::new(None).to_bytes();
+        assert_eq!(header[0x22], 0);
+        header.extend(block_with(
+            vec![
+                dir(".", BLOCK_0),
+                dir("..", BLOCK_0),
+                file("plain.txt", BLOCK_1, 5),
+            ],
+            0,
+            None,
+        ));
+        header.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("repackplain", &header);
+        let dest = TempPath::new("repackplain");
+        archive.open().repack(&dest.path).expect("repack");
+
+        // Still flagged plaintext, and still readable.
+        assert_eq!(std::fs::read(&dest.path).expect("read")[0x22], 0);
+        let repacked = Archive::open(&dest.path).expect("open");
+        assert_eq!(names(&repacked.list(".").expect("list")), vec!["plain.txt"]);
+        assert_eq!(
+            repacked.extract("plain.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_preserves_a_euc_kr_name() {
+        let mut named = hole();
+        named[0] = 2;
+        named[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+        named[OFF_POSITION..OFF_POSITION + 8].copy_from_slice(&BLOCK_1.to_le_bytes());
+        named[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&5u32.to_le_bytes());
+
+        let mut raw = valid_header();
+        raw.extend(block(vec![dir(".", BLOCK_0), dir("..", BLOCK_0), named], 0));
+        raw.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("repackeuckr", &raw);
+        let dest = TempPath::new("repackeuckr");
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open");
+        let listed = repacked.list(".").expect("list");
+        assert_eq!(listed.len(), 1);
+        if cfg!(feature = "euc-kr") {
+            assert_eq!(listed[0].name(), "한글.txt");
+        }
+    }
+
+    #[test]
+    fn repack_is_idempotent() {
+        let archive = TempArchive::new("repackidem", &chained_archive());
+        let once = TempPath::new("repackidem1");
+        let twice = TempPath::new("repackidem2");
+
+        archive.open().repack(&once.path).expect("first repack");
+        Archive::open(&once.path)
+            .expect("open")
+            .repack(&twice.path)
+            .expect("second repack");
+
+        assert_eq!(
+            std::fs::read(&once.path).expect("read"),
+            std::fs::read(&twice.path).expect("read"),
+            "repacking an already-repacked archive must be a no-op"
+        );
+    }
+
+    // --- header and key ----------------------------------------------------
+
+    #[test]
+    fn rejects_a_file_that_is_not_an_archive() {
+        let archive = TempArchive::new("notpk2", &vec![0u8; 4096]);
+        assert!(matches!(
+            Archive::open(&archive.path),
+            Err(Error::NotAnArchive)
+        ));
+    }
+
+    #[test]
+    fn reports_an_unsupported_version() {
+        let mut raw = chained_archive();
+        // Version sits at 0x1E, just past the 30-byte signature.
+        raw[0x1E..0x22].copy_from_slice(&0x0100_0009u32.to_le_bytes());
+
+        let archive = TempArchive::new("badversion", &raw);
+        assert!(matches!(
+            Archive::open(&archive.path),
+            Err(Error::UnsupportedVersion(0x0100_0009))
+        ));
+    }
+
+    #[test]
+    fn reports_a_wrong_key_instead_of_decoding_noise() {
+        // Without the header check this would decrypt the root block to
+        // garbage and surface as InvalidEntryKind, or worse, as a plausible
+        // entry pointing at a bogus offset.
+        let archive = TempArchive::new("wrongkey", &chained_archive());
+        assert!(matches!(
+            Archive::open_with_key(&archive.path, b"000000"),
+            Err(Error::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn accepts_the_correct_explicit_key() {
+        let archive = TempArchive::new("rightkey", &chained_archive());
+        assert!(Archive::open_with_key(&archive.path, DEFAULT_KEY).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_key_blowfish_cannot_accept() {
+        let archive = TempArchive::new("keylen", &chained_archive());
+        assert!(matches!(
+            Archive::open_with_key(&archive.path, b""),
+            Err(Error::InvalidKeyLength(0))
+        ));
+        assert!(matches!(
+            Archive::open_with_key(&archive.path, &[0u8; 57]),
+            Err(Error::InvalidKeyLength(57))
+        ));
+    }
+
+    #[test]
+    fn reads_an_archive_with_a_plaintext_index() {
+        // The header's encrypted flag is honoured; some tools emit these.
+        let mut header = Header::new(Some(&cipher())).to_bytes();
+        header[0x22] = 0; // encrypted = false
+
+        let mut raw = header;
+        raw.extend(block_with(
+            vec![
+                dir(".", BLOCK_0),
+                dir("..", BLOCK_0),
+                file("plain.txt", BLOCK_1, 5),
+            ],
+            0,
+            None,
+        ));
+        raw.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("plaintext", &raw);
+        let opened = Archive::open(&archive.path).expect("open");
+        assert_eq!(names(&opened.list(".").expect("list")), vec!["plain.txt"]);
+        assert_eq!(
+            opened.extract("plain.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
     // --- entry parsing -----------------------------------------------------
 
     #[test]
@@ -691,6 +1359,44 @@ mod tests {
         let mut raw = file("ok.txt", 0, 0);
         raw[OFF_NAME + 7] = b'X'; // garbage past the terminator
         assert_eq!(Entry::from_bytes(&raw, 0).expect("parse").name(), "ok.txt");
+    }
+
+    /// "한글.txt" in EUC-KR. As UTF-8 these bytes are invalid.
+    const KOREAN_NAME_EUC_KR: &[u8] = &[0xC7, 0xD1, 0xB1, 0xDB, 0x2E, 0x74, 0x78, 0x74];
+
+    #[test]
+    fn decodes_a_euc_kr_name() {
+        let mut raw = hole();
+        raw[0] = 2;
+        raw[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+
+        let entry = Entry::from_bytes(&raw, 0).expect("parse");
+
+        if cfg!(feature = "euc-kr") {
+            assert_eq!(entry.name(), "한글.txt");
+        } else {
+            // Lossy UTF-8 cannot recover these bytes, but must not panic and
+            // must still preserve the ASCII tail.
+            assert!(entry.name().ends_with(".txt"));
+        }
+    }
+
+    #[test]
+    fn ascii_names_decode_identically_either_way() {
+        // EUC-KR is ASCII-compatible, so the feature must not change these.
+        let entry = Entry::from_bytes(&file("weapon.txt", 0, 0), 0).expect("parse");
+        assert_eq!(entry.name(), "weapon.txt");
+    }
+
+    #[test]
+    fn a_euc_kr_name_survives_a_rewrite() {
+        // Names are preserved as raw bytes, so patch must not mangle them.
+        let mut raw = hole();
+        raw[0] = 2;
+        raw[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+
+        let entry = Entry::from_bytes(&raw, 0).expect("parse");
+        assert_eq!(entry.to_bytes(), raw);
     }
 
     #[test]
@@ -753,7 +1459,7 @@ mod tests {
 
     #[test]
     fn detects_a_chain_cycle() {
-        let mut raw = vec![0u8; HEADER_SIZE as usize];
+        let mut raw = valid_header();
         raw.extend(block(vec![dir(".", BLOCK_0), dir("..", BLOCK_0)], BLOCK_0));
 
         let archive = TempArchive::new("cycle", &raw);
@@ -868,6 +1574,34 @@ mod tests {
     }
 
     #[test]
+    fn patch_is_visible_through_the_same_handle() {
+        // patch writes through a separate handle while the read handle stays
+        // open, so the two must not go out of step.
+        let archive = TempArchive::new("coherent", &chained_archive());
+        let opened = archive.open();
+
+        opened.patch("sub/inner.txt", b"rewritten").expect("patch");
+
+        assert_eq!(
+            opened.extract("sub/inner.txt").expect("extract"),
+            b"rewritten".to_vec(),
+            "the open read handle must see the write"
+        );
+    }
+
+    #[test]
+    fn many_reads_reuse_one_handle() {
+        // Walking a tree used to reopen the file for every 128-byte read.
+        let archive = TempArchive::new("reuse", &chained_archive());
+        let opened = archive.open();
+
+        for _ in 0..64 {
+            assert_eq!(opened.list(".").expect("list").len(), 5);
+            assert_eq!(opened.list("sub").expect("list").len(), 1);
+        }
+    }
+
+    #[test]
     fn patch_leaves_other_entries_alone() {
         let archive = TempArchive::new("patchother", &chained_archive());
 
@@ -899,6 +1633,6 @@ mod tests {
     #[test]
     fn opening_a_missing_file_is_an_io_error() {
         let missing = std::env::temp_dir().join("pk2-test-does-not-exist.pk2");
-        assert!(matches!(Extractor::open(missing), Err(Error::Io(_))));
+        assert!(matches!(Archive::open(missing), Err(Error::Io(_))));
     }
 }
