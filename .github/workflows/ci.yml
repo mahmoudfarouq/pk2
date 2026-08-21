@@ -49,6 +49,10 @@ jobs:
       - name: Doctests
         run: cargo test --doc
 
+      # euc-kr is a default feature, so the fallback path needs covering too.
+      - name: Test without default features
+        run: cargo test --all-targets --no-default-features
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
@@ -66,6 +70,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy without default features
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   docs:
     name: rustdoc

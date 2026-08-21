@@ -212,12 +212,13 @@ impl Entry {
         self.kind
     }
 
-    /// The entry's name, decoded lossily.
+    /// The entry's name.
     ///
-    /// Original Joymax archives store names in EUC-KR, which this does not yet
-    /// decode; non-ASCII names come back with replacement characters.
+    /// Decoded as EUC-KR, which is what original Joymax archives use. Without
+    /// the `euc-kr` feature this falls back to lossy UTF-8, and Korean names
+    /// come back as replacement characters.
     pub fn name(&self) -> String {
-        String::from_utf8_lossy(self.raw_name()).into_owned()
+        decode_name(self.raw_name())
     }
 
     /// For a file, the offset of its payload. For a directory, the head of its
@@ -585,6 +586,23 @@ fn split_path(path: &str) -> impl Iterator<Item = &str> + '_ {
         .filter(|component| !component.is_empty() && *component != ".")
 }
 
+/// Decode a name field's bytes.
+///
+/// EUC-KR is ASCII-compatible, so ASCII names decode identically either way.
+fn decode_name(raw: &[u8]) -> String {
+    #[cfg(feature = "euc-kr")]
+    {
+        encoding_rs::EUC_KR
+            .decode_without_bom_handling(raw)
+            .0
+            .into_owned()
+    }
+    #[cfg(not(feature = "euc-kr"))]
+    {
+        String::from_utf8_lossy(raw).into_owned()
+    }
+}
+
 fn read_u64(raw: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes"))
 }
@@ -867,6 +885,44 @@ mod tests {
         let mut raw = file("ok.txt", 0, 0);
         raw[OFF_NAME + 7] = b'X'; // garbage past the terminator
         assert_eq!(Entry::from_bytes(&raw, 0).expect("parse").name(), "ok.txt");
+    }
+
+    /// "한글.txt" in EUC-KR. As UTF-8 these bytes are invalid.
+    const KOREAN_NAME_EUC_KR: &[u8] = &[0xC7, 0xD1, 0xB1, 0xDB, 0x2E, 0x74, 0x78, 0x74];
+
+    #[test]
+    fn decodes_a_euc_kr_name() {
+        let mut raw = hole();
+        raw[0] = 2;
+        raw[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+
+        let entry = Entry::from_bytes(&raw, 0).expect("parse");
+
+        if cfg!(feature = "euc-kr") {
+            assert_eq!(entry.name(), "한글.txt");
+        } else {
+            // Lossy UTF-8 cannot recover these bytes, but must not panic and
+            // must still preserve the ASCII tail.
+            assert!(entry.name().ends_with(".txt"));
+        }
+    }
+
+    #[test]
+    fn ascii_names_decode_identically_either_way() {
+        // EUC-KR is ASCII-compatible, so the feature must not change these.
+        let entry = Entry::from_bytes(&file("weapon.txt", 0, 0), 0).expect("parse");
+        assert_eq!(entry.name(), "weapon.txt");
+    }
+
+    #[test]
+    fn a_euc_kr_name_survives_a_rewrite() {
+        // Names are preserved as raw bytes, so patch must not mangle them.
+        let mut raw = hole();
+        raw[0] = 2;
+        raw[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+
+        let entry = Entry::from_bytes(&raw, 0).expect("parse");
+        assert_eq!(entry.to_bytes(), raw);
     }
 
     #[test]
