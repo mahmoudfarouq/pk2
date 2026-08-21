@@ -1,0 +1,18 @@
+version: 2
+
+updates:
+  # The workflows pin action versions, so those need keeping current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore"
+
+  # No dependencies today, but this covers the crate as soon as it gains any.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore"

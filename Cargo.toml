@@ -2,16 +2,11 @@
 name = "pk2"
 version = "0.1.0"
 authors = ["mahmoudFarouk <mahmoud.farouk987@gmail.com>"]
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[lib]
-name = "pk2"
-crate-type = ["cdylib"]
+edition = "2024"
+description = "Read and modify Silkroad Online PK2 archives"
+repository = "https://github.com/mahmoudfarouq/pk2"
+readme = "README.md"
+keywords = ["pk2", "silkroad", "archive"]
+categories = ["filesystem", "parser-implementations"]
 
 [dependencies]
-bytes = "0.5.6"
-
-[dependencies.pyo3]
-version = "0.11.1"
