@@ -29,7 +29,6 @@ fixing them. This list shrinks as work lands.
 | Gap | Spec reference |
 |---|---|
 | Filenames are decoded as UTF-8; original archives use EUC-KR | [§3 Names](file-format.md#names) |
-| The archive is reopened for every 128-byte read | — |
 | No repack, so payloads orphaned by `patch` are never reclaimed | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
 | `Extractor` also patches, so the name no longer describes the type | — |
 
@@ -46,6 +45,7 @@ fixing them. This list shrinks as work lands.
 | Header was never read: no signature, version or key check | `feat/production-hardening` |
 | The derived Blowfish key was hardcoded | `feat/production-hardening` |
 | The header's `encrypted` flag was ignored | `feat/production-hardening` |
+| The archive was reopened for every 128-byte read | `feat/production-hardening` |
 
 ## Testing against a real archive
 

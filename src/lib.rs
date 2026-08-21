@@ -18,6 +18,7 @@
 //! # }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::error;
 use std::fmt;
@@ -326,6 +327,15 @@ impl fmt::Display for Entry {
 /// An open PK2 archive.
 pub struct Extractor {
     path: PathBuf,
+    /// One read handle for the archive's lifetime.
+    ///
+    /// Reads are a seek plus a `read_exact`, so nothing is buffered here and a
+    /// separate write handle opened by [`Extractor::patch`] stays coherent
+    /// with it. Opened read-only, so read-only archives can be listed.
+    ///
+    /// `RefCell` rather than a lock: seeking mutates the handle, and the read
+    /// methods take `&self`. This makes `Extractor` `!Sync`.
+    file: RefCell<File>,
     /// `None` when the header says the index is stored in the clear.
     cipher: Option<BlowFish>,
     root: Entry,
@@ -350,7 +360,9 @@ impl Extractor {
     pub fn open_with_key<P: AsRef<Path>>(path: P, ascii_key: &[u8]) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        let raw: [u8; HEADER_SIZE] = read_at(&path, 0, HEADER_SIZE)?
+        let file = RefCell::new(File::open(&path)?);
+
+        let raw: [u8; HEADER_SIZE] = read_at(&file, 0, HEADER_SIZE)?
             .try_into()
             .expect("read_at returns the requested length");
         let header = Header::parse(&raw);
@@ -373,9 +385,14 @@ impl Extractor {
             None
         };
 
-        let root = read_entry_at(&path, cipher.as_ref(), ROOT_BLOCK_OFFSET)?;
+        let root = read_entry_at(&file, cipher.as_ref(), ROOT_BLOCK_OFFSET)?;
 
-        Ok(Self { path, cipher, root })
+        Ok(Self {
+            path,
+            file,
+            cipher,
+            root,
+        })
     }
 
     /// The root directory entry.
@@ -422,7 +439,7 @@ impl Extractor {
         if !entry.is_file() {
             return Err(Error::NotAFile(path.to_string()));
         }
-        Ok(read_at(&self.path, entry.position, entry.size as usize)?)
+        Ok(read_at(&self.file, entry.position, entry.size as usize)?)
     }
 
     /// Replace a file's contents.
@@ -501,7 +518,7 @@ impl Extractor {
     }
 
     fn read_block(&self, offset: u64) -> Result<Vec<Entry>> {
-        read_block_at(&self.path, self.cipher.as_ref(), offset)
+        read_block_at(&self.file, self.cipher.as_ref(), offset)
     }
 }
 
@@ -510,8 +527,12 @@ impl Extractor {
 // ---------------------------------------------------------------------------
 
 /// Read the 20 entries of the block at `offset`, decrypting if needed.
-fn read_block_at(path: &Path, cipher: Option<&BlowFish>, offset: u64) -> Result<Vec<Entry>> {
-    let mut raw = read_at(path, offset, BLOCK_SIZE)?;
+fn read_block_at(
+    file: &RefCell<File>,
+    cipher: Option<&BlowFish>,
+    offset: u64,
+) -> Result<Vec<Entry>> {
+    let mut raw = read_at(file, offset, BLOCK_SIZE)?;
     if let Some(cipher) = cipher {
         cipher.decrypt(&mut raw);
     }
@@ -525,16 +546,17 @@ fn read_block_at(path: &Path, cipher: Option<&BlowFish>, offset: u64) -> Result<
 }
 
 /// Read the single entry at `offset`, decrypting if needed.
-fn read_entry_at(path: &Path, cipher: Option<&BlowFish>, offset: u64) -> Result<Entry> {
-    let mut raw = read_at(path, offset, ENTRY_SIZE)?;
+fn read_entry_at(file: &RefCell<File>, cipher: Option<&BlowFish>, offset: u64) -> Result<Entry> {
+    let mut raw = read_at(file, offset, ENTRY_SIZE)?;
     if let Some(cipher) = cipher {
         cipher.decrypt(&mut raw);
     }
     Entry::from_bytes(&raw, offset)
 }
 
-fn read_at(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+/// Read `len` bytes at `offset` through the archive's shared handle.
+fn read_at(file: &RefCell<File>, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut file = file.borrow_mut();
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; len];
     file.read_exact(&mut buffer)?;
@@ -1019,6 +1041,34 @@ mod tests {
             archive.open().extract("sub/inner.txt").expect("extract"),
             b"replacement".to_vec()
         );
+    }
+
+    #[test]
+    fn patch_is_visible_through_the_same_handle() {
+        // patch writes through a separate handle while the read handle stays
+        // open, so the two must not go out of step.
+        let archive = TempArchive::new("coherent", &chained_archive());
+        let opened = archive.open();
+
+        opened.patch("sub/inner.txt", b"rewritten").expect("patch");
+
+        assert_eq!(
+            opened.extract("sub/inner.txt").expect("extract"),
+            b"rewritten".to_vec(),
+            "the open read handle must see the write"
+        );
+    }
+
+    #[test]
+    fn many_reads_reuse_one_handle() {
+        // Walking a tree used to reopen the file for every 128-byte read.
+        let archive = TempArchive::new("reuse", &chained_archive());
+        let opened = archive.open();
+
+        for _ in 0..64 {
+            assert_eq!(opened.list(".").expect("list").len(), 5);
+            assert_eq!(opened.list("sub").expect("list").len(), 1);
+        }
     }
 
     #[test]
