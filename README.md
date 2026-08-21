@@ -5,7 +5,7 @@
 A Rust library for reading and modifying Silkroad Online PK2 archives.
 
 ```rust
-let archive = pk2::Extractor::open("Media.pk2")?;
+let archive = pk2::Archive::open("Media.pk2")?;
 
 for entry in archive.list("server_dep/silkroad/textdata")? {
     println!("{}", entry);

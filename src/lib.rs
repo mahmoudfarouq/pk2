@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), pk2::Error> {
-//! let archive = pk2::Extractor::open("Media.pk2")?;
+//! let archive = pk2::Archive::open("Media.pk2")?;
 //!
 //! for entry in archive.list("server_dep/silkroad/textdata")? {
 //!     println!("{}", entry);
@@ -326,26 +326,29 @@ impl fmt::Display for Entry {
 // ---------------------------------------------------------------------------
 
 /// An open PK2 archive.
-pub struct Extractor {
+///
+/// Opened read-only for listing and extracting; [`Archive::patch`] writes
+/// through its own handle.
+pub struct Archive {
     path: PathBuf,
     /// One read handle for the archive's lifetime.
     ///
     /// Reads are a seek plus a `read_exact`, so nothing is buffered here and a
-    /// separate write handle opened by [`Extractor::patch`] stays coherent
+    /// separate write handle opened by [`Archive::patch`] stays coherent
     /// with it. Opened read-only, so read-only archives can be listed.
     ///
     /// `RefCell` rather than a lock: seeking mutates the handle, and the read
-    /// methods take `&self`. This makes `Extractor` `!Sync`.
+    /// methods take `&self`. This makes `Archive` `!Sync`.
     file: RefCell<File>,
     /// `None` when the header says the index is stored in the clear.
     cipher: Option<BlowFish>,
     root: Entry,
 }
 
-impl Extractor {
+impl Archive {
     /// Open an archive packed with the default international key.
     ///
-    /// Equivalent to [`Extractor::open_with_key`] with [`DEFAULT_KEY`].
+    /// Equivalent to [`Archive::open_with_key`] with [`DEFAULT_KEY`].
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_key(path, DEFAULT_KEY)
     }
@@ -637,8 +640,8 @@ mod tests {
             TempArchive { path }
         }
 
-        fn open(&self) -> Extractor {
-            Extractor::open(&self.path).expect("open the fixture")
+        fn open(&self) -> Archive {
+            Archive::open(&self.path).expect("open the fixture")
         }
     }
 
@@ -779,7 +782,7 @@ mod tests {
     fn rejects_a_file_that_is_not_an_archive() {
         let archive = TempArchive::new("notpk2", &vec![0u8; 4096]);
         assert!(matches!(
-            Extractor::open(&archive.path),
+            Archive::open(&archive.path),
             Err(Error::NotAnArchive)
         ));
     }
@@ -792,7 +795,7 @@ mod tests {
 
         let archive = TempArchive::new("badversion", &raw);
         assert!(matches!(
-            Extractor::open(&archive.path),
+            Archive::open(&archive.path),
             Err(Error::UnsupportedVersion(0x0100_0009))
         ));
     }
@@ -804,7 +807,7 @@ mod tests {
         // entry pointing at a bogus offset.
         let archive = TempArchive::new("wrongkey", &chained_archive());
         assert!(matches!(
-            Extractor::open_with_key(&archive.path, b"000000"),
+            Archive::open_with_key(&archive.path, b"000000"),
             Err(Error::InvalidKey)
         ));
     }
@@ -812,18 +815,18 @@ mod tests {
     #[test]
     fn accepts_the_correct_explicit_key() {
         let archive = TempArchive::new("rightkey", &chained_archive());
-        assert!(Extractor::open_with_key(&archive.path, DEFAULT_KEY).is_ok());
+        assert!(Archive::open_with_key(&archive.path, DEFAULT_KEY).is_ok());
     }
 
     #[test]
     fn rejects_a_key_blowfish_cannot_accept() {
         let archive = TempArchive::new("keylen", &chained_archive());
         assert!(matches!(
-            Extractor::open_with_key(&archive.path, b""),
+            Archive::open_with_key(&archive.path, b""),
             Err(Error::InvalidKeyLength(0))
         ));
         assert!(matches!(
-            Extractor::open_with_key(&archive.path, &[0u8; 57]),
+            Archive::open_with_key(&archive.path, &[0u8; 57]),
             Err(Error::InvalidKeyLength(57))
         ));
     }
@@ -847,7 +850,7 @@ mod tests {
         raw.extend_from_slice(b"hello");
 
         let archive = TempArchive::new("plaintext", &raw);
-        let opened = Extractor::open(&archive.path).expect("open");
+        let opened = Archive::open(&archive.path).expect("open");
         assert_eq!(names(&opened.list(".").expect("list")), vec!["plain.txt"]);
         assert_eq!(
             opened.extract("plain.txt").expect("extract"),
@@ -1159,6 +1162,6 @@ mod tests {
     #[test]
     fn opening_a_missing_file_is_an_io_error() {
         let missing = std::env::temp_dir().join("pk2-test-does-not-exist.pk2");
-        assert!(matches!(Extractor::open(missing), Err(Error::Io(_))));
+        assert!(matches!(Archive::open(missing), Err(Error::Io(_))));
     }
 }

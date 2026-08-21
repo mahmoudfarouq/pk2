@@ -29,7 +29,6 @@ fixing them. This list shrinks as work lands.
 | Gap | Spec reference |
 |---|---|
 | No repack, so payloads orphaned by `patch` are never reclaimed | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
-| `Extractor` also patches, so the name no longer describes the type | — |
 
 ### Closed
 
@@ -46,6 +45,7 @@ fixing them. This list shrinks as work lands.
 | The header's `encrypted` flag was ignored | `feat/production-hardening` |
 | The archive was reopened for every 128-byte read | `feat/production-hardening` |
 | Filenames were decoded as UTF-8 rather than EUC-KR | `feat/production-hardening` |
+| `Extractor` also patched, so the name did not describe the type | `feat/production-hardening` |
 
 ## Testing against a real archive
 
