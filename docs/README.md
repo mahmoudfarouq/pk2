@@ -6,6 +6,7 @@ Reference material for the PK2 archive format and for this crate.
 |---|---|
 | [file-format.md](file-format.md) | Header, entry, block and chain layout; how directories are linked; traversal rules |
 | [encryption.md](encryption.md) | Blowfish usage, the salt-XOR key derivation, key verification |
+| [roadmap.md](roadmap.md) | Known improvement opportunities, recorded for later; none in progress |
 
 ## About the format
 
