@@ -27,7 +27,7 @@ jobs:
         # path separators, so all three platforms are worth covering.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install stable toolchain
         run: |
@@ -53,7 +53,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install stable toolchain
         run: |
@@ -74,7 +74,7 @@ jobs:
       # Catches broken intra-doc links, which a plain build will not.
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install stable toolchain
         run: |
@@ -88,7 +88,7 @@ jobs:
     name: docs/ links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The format reference in docs/ is a deliverable in its own right, and
       # cross-references between its sections are easy to break silently.
