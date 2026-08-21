@@ -26,9 +26,7 @@ fact.
 Written down so the format docs can serve as the acceptance criteria for
 fixing them. This list shrinks as work lands.
 
-| Gap | Spec reference |
-|---|---|
-| No repack, so payloads orphaned by `patch` are never reclaimed | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
+Nothing outstanding. Everything tracked here has been addressed.
 
 ### Closed
 
@@ -46,6 +44,7 @@ fixing them. This list shrinks as work lands.
 | The archive was reopened for every 128-byte read | `feat/production-hardening` |
 | Filenames were decoded as UTF-8 rather than EUC-KR | `feat/production-hardening` |
 | `Extractor` also patched, so the name did not describe the type | `feat/production-hardening` |
+| No repack, so payloads orphaned by `patch` were never reclaimed | `feat/production-hardening` |
 
 ## Testing against a real archive
 

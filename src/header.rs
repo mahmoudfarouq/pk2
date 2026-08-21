@@ -35,21 +35,22 @@ pub struct Header {
     encrypted: bool,
     verify: [u8; 16],
     /// Kept so rewriting a header preserves bytes we do not interpret.
-    #[allow(dead_code, reason = "read back by to_bytes, which repack uses")]
     reserved: [u8; RESERVED_BYTES],
 }
 
 impl Header {
-    /// Build a header describing an archive encrypted with `blowfish`.
-    #[allow(dead_code, reason = "used by tests and by repack")]
-    pub fn new_encrypted(blowfish: &BlowFish) -> Self {
+    /// Build a header for an archive whose index is encrypted with `cipher`,
+    /// or stored in the clear when `cipher` is `None`.
+    pub fn new(cipher: Option<&BlowFish>) -> Self {
         let mut verify = *CHECKSUM;
-        blowfish.encrypt(&mut verify);
+        if let Some(cipher) = cipher {
+            cipher.encrypt(&mut verify);
+        }
 
         Self {
             signature: *SIGNATURE,
             version: VERSION,
-            encrypted: true,
+            encrypted: cipher.is_some(),
             verify,
             reserved: [0; RESERVED_BYTES],
         }
@@ -79,7 +80,6 @@ impl Header {
         }
     }
 
-    #[allow(dead_code, reason = "used by tests and by repack")]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut raw = vec![0u8; HEADER_SIZE];
         raw[OFF_SIGNATURE..OFF_SIGNATURE + 30].copy_from_slice(&self.signature);
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_bytes() {
-        let header = Header::new_encrypted(&key());
+        let header = Header::new(Some(&key()));
         let raw: [u8; HEADER_SIZE] = header.to_bytes().try_into().unwrap();
         let parsed = Header::parse(&raw);
 
@@ -162,13 +162,21 @@ mod tests {
     }
 
     #[test]
+    fn a_plaintext_header_is_not_marked_encrypted() {
+        let header = Header::new(None);
+        assert!(!header.is_encrypted());
+        assert!(header.has_valid_signature());
+        assert!(header.is_supported_version());
+    }
+
+    #[test]
     fn accepts_the_key_it_was_built_with() {
-        assert!(Header::new_encrypted(&key()).key_matches(&key()));
+        assert!(Header::new(Some(&key())).key_matches(&key()));
     }
 
     #[test]
     fn rejects_a_different_key() {
-        let header = Header::new_encrypted(&key());
+        let header = Header::new(Some(&key()));
         let wrong = BlowFish::from_ascii_key(b"000000").unwrap();
         assert!(!header.key_matches(&wrong));
     }
@@ -177,7 +185,7 @@ mod tests {
     fn compares_only_the_stored_checksum_bytes() {
         // Corrupting a byte past the third must not change the verdict, since
         // the format never stored those bytes reliably.
-        let mut header = Header::new_encrypted(&key());
+        let mut header = Header::new(Some(&key()));
         header.verify[CHECKSUM_STORED] ^= 0xFF;
         assert!(header.key_matches(&key()));
 
@@ -187,16 +195,14 @@ mod tests {
 
     #[test]
     fn rejects_a_corrupt_signature() {
-        let mut raw: [u8; HEADER_SIZE] =
-            Header::new_encrypted(&key()).to_bytes().try_into().unwrap();
+        let mut raw: [u8; HEADER_SIZE] = Header::new(Some(&key())).to_bytes().try_into().unwrap();
         raw[0] = b'X';
         assert!(!Header::parse(&raw).has_valid_signature());
     }
 
     #[test]
     fn reports_an_unknown_version() {
-        let mut raw: [u8; HEADER_SIZE] =
-            Header::new_encrypted(&key()).to_bytes().try_into().unwrap();
+        let mut raw: [u8; HEADER_SIZE] = Header::new(Some(&key())).to_bytes().try_into().unwrap();
         raw[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&0x0100_0003u32.to_le_bytes());
 
         let parsed = Header::parse(&raw);
@@ -207,8 +213,7 @@ mod tests {
 
     #[test]
     fn preserves_reserved_bytes() {
-        let mut raw: [u8; HEADER_SIZE] =
-            Header::new_encrypted(&key()).to_bytes().try_into().unwrap();
+        let mut raw: [u8; HEADER_SIZE] = Header::new(Some(&key())).to_bytes().try_into().unwrap();
         raw[OFF_RESERVED] = 0xAB;
         raw[HEADER_SIZE - 1] = 0xCD;
 

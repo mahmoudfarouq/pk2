@@ -13,7 +13,12 @@ for entry in archive.list("server_dep/silkroad/textdata")? {
 
 let bytes = archive.extract("server_dep/silkroad/textdata/weapon.txt")?;
 archive.patch("server_dep/silkroad/textdata/weapon.txt", &bytes)?;
+
+// Patching orphans the old payload; repacking reclaims the space.
+archive.repack("Media.repacked.pk2")?;
 ```
+
+Archives packed with a non-default key open with `Archive::open_with_key`.
 
 ## Documentation
 
@@ -26,8 +31,16 @@ The archive format is documented in [`docs/`](docs/):
 
 ## Status
 
-Reads and patches archives packed with the default international key. Known
-limitations are tracked in [`docs/README.md`](docs/README.md#known-gaps-in-this-implementation).
+Reads, patches and repacks archives, with any key. The header is validated
+before the index is touched, so a wrong key or a non-archive fails with a clear
+error rather than decoding to noise. Progress is tracked in
+[`docs/README.md`](docs/README.md#known-gaps-in-this-implementation).
+
+## Features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `euc-kr` | on | Decode filenames as EUC-KR, which original Joymax archives use. Without it names fall back to lossy UTF-8. |
 
 ## Testing
 

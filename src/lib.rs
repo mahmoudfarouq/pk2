@@ -263,6 +263,51 @@ impl Entry {
         name == &b"."[..] || name == &b".."[..]
     }
 
+    /// An unused slot.
+    fn empty() -> Self {
+        Self {
+            offset: 0,
+            kind: EntryKind::Empty,
+            name: [0; NAME_BYTES],
+            access_date: 0,
+            create_date: 0,
+            modify_date: 0,
+            position: 0,
+            size: 0,
+            next_block: 0,
+            padding: [0, 0],
+        }
+    }
+
+    /// A directory entry named `name`, pointing at `children_chain`.
+    ///
+    /// Used to synthesise the `.` and `..` links when writing a chain.
+    fn new_directory(name: &[u8], children_chain: u64) -> Self {
+        let mut raw_name = [0u8; NAME_BYTES];
+        let len = name.len().min(NAME_BYTES - 1);
+        raw_name[..len].copy_from_slice(&name[..len]);
+
+        Self {
+            kind: EntryKind::Directory,
+            name: raw_name,
+            position: children_chain,
+            ..Self::empty()
+        }
+    }
+
+    /// This entry pointing at `position` instead, with its chain link cleared.
+    ///
+    /// Name, kind, size and timestamps carry over verbatim, so a repack
+    /// preserves them byte for byte.
+    fn relocated(&self, position: u64) -> Self {
+        Self {
+            offset: 0,
+            position,
+            next_block: 0,
+            ..*self
+        }
+    }
+
     fn from_bytes(raw: &[u8], offset: u64) -> Result<Self> {
         debug_assert_eq!(raw.len(), ENTRY_SIZE, "entries are always 128 bytes");
 
@@ -474,6 +519,114 @@ impl Archive {
         Ok(())
     }
 
+    /// Write a defragmented copy of this archive to `dest`.
+    ///
+    /// [`Archive::patch`] appends the new payload and orphans the old one, so a
+    /// repeatedly patched archive carries dead weight the format has no free
+    /// list to reclaim. Repacking walks the tree and writes only reachable
+    /// data, rebuilding block chains compactly.
+    ///
+    /// The copy keeps the source's encryption state and key, and preserves
+    /// names, sizes and timestamps verbatim.
+    ///
+    /// Fails if `dest` already exists, rather than truncating it.
+    pub fn repack<P: AsRef<Path>>(&self, dest: P) -> Result<()> {
+        let mut plan = self.plan()?;
+        let payloads = assign_offsets(&mut plan);
+        self.write_repacked(dest.as_ref(), &plan, &payloads)
+    }
+
+    /// Walk the tree, breadth first, into one `PlannedDir` per directory.
+    fn plan(&self) -> Result<Vec<PlannedDir>> {
+        let mut plan = vec![PlannedDir::new(None)];
+
+        // Aliased chains would make the walk recurse for ever, so a repack of
+        // a structurally broken archive fails rather than looping.
+        let mut visited = HashSet::new();
+        visited.insert(self.root.position);
+
+        let mut queue = vec![(0usize, self.root)];
+        while let Some((index, entry)) = queue.pop() {
+            for child in self.children(&entry)? {
+                match child.kind {
+                    EntryKind::File => plan[index].files.push(child),
+                    EntryKind::Directory => {
+                        if !visited.insert(child.position) {
+                            return Err(Error::ChainCycle(child.position));
+                        }
+                        let child_index = plan.len();
+                        plan.push(PlannedDir::new(Some(child)));
+                        plan[index].subdirs.push(child_index);
+                        queue.push((child_index, child));
+                    }
+                    EntryKind::Empty => {}
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn write_repacked(
+        &self,
+        dest: &Path,
+        plan: &[PlannedDir],
+        payloads: &[Vec<u64>],
+    ) -> Result<()> {
+        let mut out = OpenOptions::new().write(true).create_new(true).open(dest)?;
+
+        out.write_all(&Header::new(self.cipher.as_ref()).to_bytes())?;
+
+        for (dir, offsets) in plan.iter().zip(payloads) {
+            let blocks = dir.blocks();
+            let mut entries = Vec::with_capacity(blocks * BLOCK_ENTRY_COUNT);
+
+            entries.push(Entry::new_directory(b".", dir.chain));
+            entries.push(Entry::new_directory(b"..", dir.parent_chain));
+
+            for &child in &dir.subdirs {
+                let source = plan[child].source.expect("only the root has no source");
+                entries.push(source.relocated(plan[child].chain));
+            }
+            for (file, &offset) in dir.files.iter().zip(offsets) {
+                entries.push(file.relocated(offset));
+            }
+            entries.resize(blocks * BLOCK_ENTRY_COUNT, Entry::empty());
+
+            // Link the blocks: the final entry of every block but the last
+            // points at the block that follows it.
+            for block in 0..blocks - 1 {
+                let last = block * BLOCK_ENTRY_COUNT + BLOCK_ENTRY_COUNT - 1;
+                entries[last].next_block = dir.chain + ((block + 1) * BLOCK_SIZE) as u64;
+            }
+
+            for block in entries.chunks(BLOCK_ENTRY_COUNT) {
+                let mut raw: Vec<u8> = block.iter().flat_map(|entry| entry.to_bytes()).collect();
+                debug_assert_eq!(raw.len(), BLOCK_SIZE);
+                if let Some(cipher) = &self.cipher {
+                    cipher.encrypt(&mut raw);
+                }
+                out.write_all(&raw)?;
+            }
+        }
+
+        let position = out.stream_position()?;
+        if let Some(&first) = payloads.iter().flatten().next() {
+            debug_assert_eq!(position, first, "payloads must start where layout said");
+        }
+
+        let mut source = self.file.borrow_mut();
+        for (dir, offsets) in plan.iter().zip(payloads) {
+            for file in dir.files.iter() {
+                copy_range(&mut source, &mut out, file.position, file.size)?;
+            }
+            debug_assert_eq!(dir.files.len(), offsets.len());
+        }
+
+        out.flush()?;
+        Ok(())
+    }
+
     /// Every child of `entry`, walking its entire block chain.
     ///
     /// Returns an empty vector for anything that is not a directory. `.` and
@@ -524,6 +677,104 @@ impl Archive {
     fn read_block(&self, offset: u64) -> Result<Vec<Entry>> {
         read_block_at(&self.file, self.cipher.as_ref(), offset)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repack planning
+// ---------------------------------------------------------------------------
+
+/// How much of a payload to move at a time.
+const COPY_CHUNK: usize = 64 * 1024;
+
+/// One directory in a repack, with offsets filled in by [`assign_offsets`].
+struct PlannedDir {
+    /// The source entry, or `None` for the root, which has none.
+    source: Option<Entry>,
+    files: Vec<Entry>,
+    /// Indices into the plan.
+    subdirs: Vec<usize>,
+    /// Offset of this directory's first block.
+    chain: u64,
+    /// Offset of the parent's first block. The root's points at itself.
+    parent_chain: u64,
+}
+
+impl PlannedDir {
+    fn new(source: Option<Entry>) -> Self {
+        Self {
+            source,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+            chain: 0,
+            parent_chain: 0,
+        }
+    }
+
+    /// Slots needed, including the `.` and `..` links.
+    fn slots(&self) -> usize {
+        2 + self.files.len() + self.subdirs.len()
+    }
+
+    /// Blocks needed to hold those slots. Never zero: a chain always has at
+    /// least one block, because it always has `.` and `..`.
+    fn blocks(&self) -> usize {
+        self.slots().div_ceil(BLOCK_ENTRY_COUNT).max(1)
+    }
+}
+
+/// Lay out the plan: every directory's chain offset, every parent link, and
+/// every payload offset.
+///
+/// Returns the payload offsets, parallel to each directory's `files`.
+fn assign_offsets(plan: &mut [PlannedDir]) -> Vec<Vec<u64>> {
+    let mut cursor = ROOT_BLOCK_OFFSET;
+    for dir in plan.iter_mut() {
+        dir.chain = cursor;
+        cursor += (dir.blocks() * BLOCK_SIZE) as u64;
+    }
+
+    // The root is its own parent, matching what other writers emit.
+    plan[0].parent_chain = plan[0].chain;
+    for index in 0..plan.len() {
+        let parent_chain = plan[index].chain;
+        for child in plan[index].subdirs.clone() {
+            plan[child].parent_chain = parent_chain;
+        }
+    }
+
+    // Payloads follow every block, in plan order.
+    plan.iter()
+        .map(|dir| {
+            dir.files
+                .iter()
+                .map(|file| {
+                    let offset = cursor;
+                    cursor += u64::from(file.size);
+                    offset
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Copy `len` bytes from `from` in `src` to the current position in `dest`.
+fn copy_range(src: &mut File, dest: &mut File, from: u64, len: u32) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    src.seek(SeekFrom::Start(from))?;
+
+    let mut remaining = len as usize;
+    let mut buffer = vec![0u8; remaining.min(COPY_CHUNK)];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len());
+        src.read_exact(&mut buffer[..take])?;
+        dest.write_all(&buffer[..take])?;
+        remaining -= take;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +935,7 @@ mod tests {
 
     /// A valid 256-byte header for an encrypted archive.
     fn valid_header() -> Vec<u8> {
-        Header::new_encrypted(&cipher()).to_bytes()
+        Header::new(Some(&cipher())).to_bytes()
     }
 
     /// Assemble up to 19 entries into one encrypted 2560-byte block.
@@ -776,6 +1027,226 @@ mod tests {
         names
     }
 
+    /// A path in the temp directory that is removed on drop.
+    struct TempPath {
+        path: PathBuf,
+    }
+
+    impl TempPath {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("pk2-dest-{name}.pk2"));
+            let _ = std::fs::remove_file(&path);
+            TempPath { path }
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A root directory holding 25 files, so its chain spans two blocks.
+    ///
+    /// Block 0 carries `.`, `..` and 17 files; block 1 carries the other 8.
+    fn wide_archive() -> Vec<u8> {
+        let mut out = valid_header();
+
+        let first: Vec<Vec<u8>> = std::iter::once(dir(".", BLOCK_0))
+            .chain(std::iter::once(dir("..", BLOCK_0)))
+            .chain((0..17).map(|i| file(&format!("f{i:02}.txt"), DATA, 5)))
+            .collect();
+        out.extend(block(first, BLOCK_1));
+
+        let second: Vec<Vec<u8>> = (17..25)
+            .map(|i| file(&format!("f{i:02}.txt"), DATA, 5))
+            .collect();
+        out.extend(block(second, 0));
+
+        // DATA is defined relative to three blocks, so pad to reach it.
+        out.resize(DATA as usize, 0);
+        out.extend_from_slice(b"hello");
+        out
+    }
+
+    // --- repack ------------------------------------------------------------
+
+    #[test]
+    fn repack_preserves_the_tree() {
+        let archive = TempArchive::new("repacksrc", &chained_archive());
+        let dest = TempPath::new("repacktree");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        assert_eq!(
+            sorted_names(&repacked.list(".").expect("list root")),
+            vec!["alpha.txt", "beta.txt", "delta.txt", "gamma.txt", "sub"]
+        );
+        assert_eq!(
+            names(&repacked.list("sub").expect("list sub")),
+            vec!["inner.txt"]
+        );
+    }
+
+    #[test]
+    fn repack_preserves_payloads() {
+        let archive = TempArchive::new("repackdata", &chained_archive());
+        let dest = TempPath::new("repackdata");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        for path in [
+            "alpha.txt",
+            "beta.txt",
+            "gamma.txt",
+            "delta.txt",
+            "sub/inner.txt",
+        ] {
+            assert_eq!(
+                repacked.extract(path).expect(path),
+                b"hello".to_vec(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn repack_rebuilds_multi_block_chains() {
+        // 25 files cannot fit one block, so the writer must chain.
+        let archive = TempArchive::new("repackwide", &wide_archive());
+        let dest = TempPath::new("repackwide");
+
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open repacked");
+        let listed = repacked.list(".").expect("list");
+        assert_eq!(listed.len(), 25, "got {:?}", sorted_names(&listed));
+        assert_eq!(
+            repacked.extract("f24.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_reclaims_orphaned_payloads() {
+        let archive = TempArchive::new("repackshrink", &chained_archive());
+
+        // Patching appends and orphans the old payload, repeatedly.
+        let opened = archive.open();
+        for _ in 0..16 {
+            opened.patch("alpha.txt", &[0xAB; 4096]).expect("patch");
+        }
+        drop(opened);
+
+        let patched_len = std::fs::metadata(&archive.path).expect("stat").len();
+        let dest = TempPath::new("repackshrink");
+        archive.open().repack(&dest.path).expect("repack");
+        let repacked_len = std::fs::metadata(&dest.path).expect("stat").len();
+
+        assert!(
+            repacked_len < patched_len,
+            "repack should shrink: {patched_len} -> {repacked_len}"
+        );
+        assert_eq!(
+            Archive::open(&dest.path)
+                .expect("open")
+                .extract("alpha.txt")
+                .expect("extract"),
+            vec![0xAB; 4096],
+            "the live payload must survive"
+        );
+    }
+
+    #[test]
+    fn repack_refuses_to_overwrite() {
+        let archive = TempArchive::new("repacknoclobber", &chained_archive());
+        let dest = TempPath::new("repacknoclobber");
+        std::fs::write(&dest.path, b"do not clobber me").expect("write");
+
+        assert!(matches!(
+            archive.open().repack(&dest.path),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            std::fs::read(&dest.path).expect("read"),
+            b"do not clobber me".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_keeps_a_plaintext_index_plaintext() {
+        let mut header = Header::new(None).to_bytes();
+        assert_eq!(header[0x22], 0);
+        header.extend(block_with(
+            vec![
+                dir(".", BLOCK_0),
+                dir("..", BLOCK_0),
+                file("plain.txt", BLOCK_1, 5),
+            ],
+            0,
+            None,
+        ));
+        header.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("repackplain", &header);
+        let dest = TempPath::new("repackplain");
+        archive.open().repack(&dest.path).expect("repack");
+
+        // Still flagged plaintext, and still readable.
+        assert_eq!(std::fs::read(&dest.path).expect("read")[0x22], 0);
+        let repacked = Archive::open(&dest.path).expect("open");
+        assert_eq!(names(&repacked.list(".").expect("list")), vec!["plain.txt"]);
+        assert_eq!(
+            repacked.extract("plain.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn repack_preserves_a_euc_kr_name() {
+        let mut named = hole();
+        named[0] = 2;
+        named[OFF_NAME..OFF_NAME + KOREAN_NAME_EUC_KR.len()].copy_from_slice(KOREAN_NAME_EUC_KR);
+        named[OFF_POSITION..OFF_POSITION + 8].copy_from_slice(&BLOCK_1.to_le_bytes());
+        named[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&5u32.to_le_bytes());
+
+        let mut raw = valid_header();
+        raw.extend(block(vec![dir(".", BLOCK_0), dir("..", BLOCK_0), named], 0));
+        raw.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("repackeuckr", &raw);
+        let dest = TempPath::new("repackeuckr");
+        archive.open().repack(&dest.path).expect("repack");
+
+        let repacked = Archive::open(&dest.path).expect("open");
+        let listed = repacked.list(".").expect("list");
+        assert_eq!(listed.len(), 1);
+        if cfg!(feature = "euc-kr") {
+            assert_eq!(listed[0].name(), "한글.txt");
+        }
+    }
+
+    #[test]
+    fn repack_is_idempotent() {
+        let archive = TempArchive::new("repackidem", &chained_archive());
+        let once = TempPath::new("repackidem1");
+        let twice = TempPath::new("repackidem2");
+
+        archive.open().repack(&once.path).expect("first repack");
+        Archive::open(&once.path)
+            .expect("open")
+            .repack(&twice.path)
+            .expect("second repack");
+
+        assert_eq!(
+            std::fs::read(&once.path).expect("read"),
+            std::fs::read(&twice.path).expect("read"),
+            "repacking an already-repacked archive must be a no-op"
+        );
+    }
+
     // --- header and key ----------------------------------------------------
 
     #[test]
@@ -834,7 +1305,7 @@ mod tests {
     #[test]
     fn reads_an_archive_with_a_plaintext_index() {
         // The header's encrypted flag is honoured; some tools emit these.
-        let mut header = Header::new_encrypted(&cipher()).to_bytes();
+        let mut header = Header::new(Some(&cipher())).to_bytes();
         header[0x22] = 0; // encrypted = false
 
         let mut raw = header;
