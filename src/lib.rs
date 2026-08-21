@@ -26,17 +26,17 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod blowfish;
+mod header;
 
 use crate::blowfish::BlowFish;
+use crate::header::{HEADER_SIZE, Header};
 
 // ---------------------------------------------------------------------------
 // Format constants. See docs/file-format.md §9.
 // ---------------------------------------------------------------------------
 
-/// Size of the archive header. The root block begins immediately after it.
-const HEADER_SIZE: u64 = 256;
 /// Offset of the first block of the root chain.
-const ROOT_BLOCK_OFFSET: u64 = HEADER_SIZE;
+const ROOT_BLOCK_OFFSET: u64 = HEADER_SIZE as u64;
 /// Every entry occupies exactly 128 bytes.
 const ENTRY_SIZE: usize = 128;
 /// Every block holds exactly 20 entries, no more and no fewer.
@@ -56,11 +56,11 @@ const OFF_SIZE: usize = 0x72;
 const OFF_NEXT_BLOCK: usize = 0x76;
 const OFF_PADDING: usize = 0x7E;
 
-/// Blowfish key for international Silkroad archives.
+/// The key international Silkroad archives are packed with.
 ///
-/// This is the ASCII key `169841` *after* PK2's salt-XOR derivation. Archives
-/// packed with any other key will not decrypt; see `docs/encryption.md`.
-const DEFAULT_KEY: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
+/// This is the ASCII key, not the derived one — see `docs/encryption.md` for
+/// the salt-XOR that turns it into Blowfish key material.
+pub const DEFAULT_KEY: &[u8] = b"169841";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -86,6 +86,14 @@ pub enum Error {
     NotAFile(String),
     /// A payload longer than `u32::MAX`, which the `size` field cannot express.
     FileTooLarge(usize),
+    /// The file does not begin with the PK2 signature.
+    NotAnArchive,
+    /// The header records a version this crate does not understand.
+    UnsupportedVersion(u32),
+    /// The header's checksum does not match the key supplied.
+    InvalidKey,
+    /// A key Blowfish cannot accept: empty, or longer than 56 bytes.
+    InvalidKeyLength(usize),
 }
 
 /// Shorthand for this crate's result type.
@@ -111,6 +119,14 @@ impl fmt::Display for Error {
                 "payload of {} bytes exceeds the 4 GiB maximum the size field can express",
                 len
             ),
+            Error::NotAnArchive => write!(f, "not a pk2 archive: signature does not match"),
+            Error::UnsupportedVersion(version) => {
+                write!(f, "unsupported archive version {:#010x}", version)
+            }
+            Error::InvalidKey => write!(f, "wrong key: the archive's checksum does not match"),
+            Error::InvalidKeyLength(len) => {
+                write!(f, "key of {} bytes; must be 1 to 56 bytes", len)
+            }
         }
     }
 }
@@ -310,25 +326,56 @@ impl fmt::Display for Entry {
 /// An open PK2 archive.
 pub struct Extractor {
     path: PathBuf,
-    blowfish: BlowFish,
+    /// `None` when the header says the index is stored in the clear.
+    cipher: Option<BlowFish>,
     root: Entry,
 }
 
 impl Extractor {
-    /// Open an archive.
+    /// Open an archive packed with the default international key.
     ///
-    /// Reads the root entry immediately, so a missing file or an undecryptable
-    /// index fails here rather than on first use.
+    /// Equivalent to [`Extractor::open_with_key`] with [`DEFAULT_KEY`].
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let blowfish = BlowFish::new(DEFAULT_KEY);
-        let root = read_entry_at(&path, &blowfish, ROOT_BLOCK_OFFSET)?;
+        Self::open_with_key(path, DEFAULT_KEY)
+    }
 
-        Ok(Self {
-            path,
-            blowfish,
-            root,
-        })
+    /// Open an archive packed with `ascii_key`.
+    ///
+    /// The key is the user-facing ASCII one, such as `b"169841"`; the salt-XOR
+    /// derivation is applied internally.
+    ///
+    /// Validates the header before touching the index, so a file that is not
+    /// an archive, is an unknown version, or was packed with a different key
+    /// fails here with a clear error rather than decrypting to noise.
+    pub fn open_with_key<P: AsRef<Path>>(path: P, ascii_key: &[u8]) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+
+        let raw: [u8; HEADER_SIZE] = read_at(&path, 0, HEADER_SIZE)?
+            .try_into()
+            .expect("read_at returns the requested length");
+        let header = Header::parse(&raw);
+
+        if !header.has_valid_signature() {
+            return Err(Error::NotAnArchive);
+        }
+        if !header.is_supported_version() {
+            return Err(Error::UnsupportedVersion(header.version()));
+        }
+
+        let cipher = if header.is_encrypted() {
+            let blowfish = BlowFish::from_ascii_key(ascii_key)
+                .ok_or(Error::InvalidKeyLength(ascii_key.len()))?;
+            if !header.key_matches(&blowfish) {
+                return Err(Error::InvalidKey);
+            }
+            Some(blowfish)
+        } else {
+            None
+        };
+
+        let root = read_entry_at(&path, cipher.as_ref(), ROOT_BLOCK_OFFSET)?;
+
+        Ok(Self { path, cipher, root })
     }
 
     /// The root directory entry.
@@ -398,7 +445,9 @@ impl Extractor {
         entry.size = data.len() as u32;
 
         let mut encoded = entry.to_bytes();
-        self.blowfish.encrypt(&mut encoded);
+        if let Some(cipher) = &self.cipher {
+            cipher.encrypt(&mut encoded);
+        }
         write_at(&self.path, entry.offset, &encoded)?;
 
         Ok(())
@@ -452,7 +501,7 @@ impl Extractor {
     }
 
     fn read_block(&self, offset: u64) -> Result<Vec<Entry>> {
-        read_block_at(&self.path, &self.blowfish, offset)
+        read_block_at(&self.path, self.cipher.as_ref(), offset)
     }
 }
 
@@ -460,10 +509,12 @@ impl Extractor {
 // Reading and writing
 // ---------------------------------------------------------------------------
 
-/// Read and decrypt the 20 entries of the block at `offset`.
-fn read_block_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Vec<Entry>> {
+/// Read the 20 entries of the block at `offset`, decrypting if needed.
+fn read_block_at(path: &Path, cipher: Option<&BlowFish>, offset: u64) -> Result<Vec<Entry>> {
     let mut raw = read_at(path, offset, BLOCK_SIZE)?;
-    blowfish.decrypt(&mut raw);
+    if let Some(cipher) = cipher {
+        cipher.decrypt(&mut raw);
+    }
 
     let (entries, _remainder) = raw.as_chunks::<ENTRY_SIZE>();
     entries
@@ -473,10 +524,12 @@ fn read_block_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Vec<En
         .collect()
 }
 
-/// Read and decrypt the single entry at `offset`.
-fn read_entry_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Entry> {
+/// Read the single entry at `offset`, decrypting if needed.
+fn read_entry_at(path: &Path, cipher: Option<&BlowFish>, offset: u64) -> Result<Entry> {
     let mut raw = read_at(path, offset, ENTRY_SIZE)?;
-    blowfish.decrypt(&mut raw);
+    if let Some(cipher) = cipher {
+        cipher.decrypt(&mut raw);
+    }
     Entry::from_bytes(&raw, offset)
 }
 
@@ -582,12 +635,29 @@ mod tests {
         vec![0u8; ENTRY_SIZE]
     }
 
+    fn cipher() -> BlowFish {
+        BlowFish::from_ascii_key(DEFAULT_KEY).expect("default key is valid")
+    }
+
+    /// A valid 256-byte header for an encrypted archive.
+    fn valid_header() -> Vec<u8> {
+        Header::new_encrypted(&cipher()).to_bytes()
+    }
+
     /// Assemble up to 19 entries into one encrypted 2560-byte block.
     ///
     /// Entry 19 is deliberately left *empty* while still carrying `next_block`.
     /// That is legal per the format and is precisely the shape a walker that
     /// stops at the first empty entry gets wrong.
-    fn block(mut entries: Vec<Vec<u8>>, next_block: u64) -> Vec<u8> {
+    fn block(entries: Vec<Vec<u8>>, next_block: u64) -> Vec<u8> {
+        block_with(entries, next_block, Some(&cipher()))
+    }
+
+    fn block_with(
+        mut entries: Vec<Vec<u8>>,
+        next_block: u64,
+        cipher: Option<&BlowFish>,
+    ) -> Vec<u8> {
         assert!(
             entries.len() < BLOCK_ENTRY_COUNT,
             "entry 19 is reserved for the chain pointer"
@@ -602,7 +672,9 @@ mod tests {
 
         let mut raw: Vec<u8> = entries.concat();
         assert_eq!(raw.len(), BLOCK_SIZE);
-        BlowFish::new(DEFAULT_KEY).encrypt(&mut raw);
+        if let Some(cipher) = cipher {
+            cipher.encrypt(&mut raw);
+        }
         raw
     }
 
@@ -616,7 +688,7 @@ mod tests {
     /// `BLOCK_1` holds a hole between real entries, and `BLOCK_0`'s chain
     /// pointer lives in an empty entry 19.
     fn chained_archive() -> Vec<u8> {
-        let mut out = vec![0u8; HEADER_SIZE as usize];
+        let mut out = valid_header();
 
         out.extend(block(
             vec![
@@ -659,6 +731,88 @@ mod tests {
         let mut names = names(entries);
         names.sort();
         names
+    }
+
+    // --- header and key ----------------------------------------------------
+
+    #[test]
+    fn rejects_a_file_that_is_not_an_archive() {
+        let archive = TempArchive::new("notpk2", &vec![0u8; 4096]);
+        assert!(matches!(
+            Extractor::open(&archive.path),
+            Err(Error::NotAnArchive)
+        ));
+    }
+
+    #[test]
+    fn reports_an_unsupported_version() {
+        let mut raw = chained_archive();
+        // Version sits at 0x1E, just past the 30-byte signature.
+        raw[0x1E..0x22].copy_from_slice(&0x0100_0009u32.to_le_bytes());
+
+        let archive = TempArchive::new("badversion", &raw);
+        assert!(matches!(
+            Extractor::open(&archive.path),
+            Err(Error::UnsupportedVersion(0x0100_0009))
+        ));
+    }
+
+    #[test]
+    fn reports_a_wrong_key_instead_of_decoding_noise() {
+        // Without the header check this would decrypt the root block to
+        // garbage and surface as InvalidEntryKind, or worse, as a plausible
+        // entry pointing at a bogus offset.
+        let archive = TempArchive::new("wrongkey", &chained_archive());
+        assert!(matches!(
+            Extractor::open_with_key(&archive.path, b"000000"),
+            Err(Error::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn accepts_the_correct_explicit_key() {
+        let archive = TempArchive::new("rightkey", &chained_archive());
+        assert!(Extractor::open_with_key(&archive.path, DEFAULT_KEY).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_key_blowfish_cannot_accept() {
+        let archive = TempArchive::new("keylen", &chained_archive());
+        assert!(matches!(
+            Extractor::open_with_key(&archive.path, b""),
+            Err(Error::InvalidKeyLength(0))
+        ));
+        assert!(matches!(
+            Extractor::open_with_key(&archive.path, &[0u8; 57]),
+            Err(Error::InvalidKeyLength(57))
+        ));
+    }
+
+    #[test]
+    fn reads_an_archive_with_a_plaintext_index() {
+        // The header's encrypted flag is honoured; some tools emit these.
+        let mut header = Header::new_encrypted(&cipher()).to_bytes();
+        header[0x22] = 0; // encrypted = false
+
+        let mut raw = header;
+        raw.extend(block_with(
+            vec![
+                dir(".", BLOCK_0),
+                dir("..", BLOCK_0),
+                file("plain.txt", BLOCK_1, 5),
+            ],
+            0,
+            None,
+        ));
+        raw.extend_from_slice(b"hello");
+
+        let archive = TempArchive::new("plaintext", &raw);
+        let opened = Extractor::open(&archive.path).expect("open");
+        assert_eq!(names(&opened.list(".").expect("list")), vec!["plain.txt"]);
+        assert_eq!(
+            opened.extract("plain.txt").expect("extract"),
+            b"hello".to_vec()
+        );
     }
 
     // --- entry parsing -----------------------------------------------------
@@ -753,7 +907,7 @@ mod tests {
 
     #[test]
     fn detects_a_chain_cycle() {
-        let mut raw = vec![0u8; HEADER_SIZE as usize];
+        let mut raw = valid_header();
         raw.extend(block(vec![dir(".", BLOCK_0), dir("..", BLOCK_0)], BLOCK_0));
 
         let archive = TempArchive::new("cycle", &raw);

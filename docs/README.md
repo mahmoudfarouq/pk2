@@ -28,8 +28,6 @@ fixing them. This list shrinks as work lands.
 
 | Gap | Spec reference |
 |---|---|
-| Header is never read: no signature check, no version check, no key verification | [§2](file-format.md#2-header) |
-| The derived Blowfish key is hardcoded, so archives packed with any other key fail to decrypt | [encryption.md — Key derivation](encryption.md#key-derivation) |
 | Filenames are decoded as UTF-8; original archives use EUC-KR | [§3 Names](file-format.md#names) |
 | The archive is reopened for every 128-byte read | — |
 | No repack, so payloads orphaned by `patch` are never reclaimed | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
@@ -45,6 +43,9 @@ fixing them. This list shrinks as work lands.
 | No cycle guard when following chains | `fix/block-chain-walk` |
 | Writes were buffered and flushed on drop, discarding I/O errors | `fix/block-chain-walk` |
 | Failures panicked instead of returning a typed error | `fix/block-chain-walk` |
+| Header was never read: no signature, version or key check | `feat/production-hardening` |
+| The derived Blowfish key was hardcoded | `feat/production-hardening` |
+| The header's `encrypted` flag was ignored | `feat/production-hardening` |
 
 ## Testing against a real archive
 
