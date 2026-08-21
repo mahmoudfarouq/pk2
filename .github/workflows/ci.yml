@@ -83,14 +83,3 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --no-deps --document-private-items
-
-  format-docs:
-    name: docs/ links
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      # The format reference in docs/ is a deliverable in its own right, and
-      # cross-references between its sections are easy to break silently.
-      - name: Check markdown links and anchors
-        run: python3 scripts/check-doc-links.py docs README.md

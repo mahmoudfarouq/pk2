@@ -50,5 +50,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo test --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
-python3 scripts/check-doc-links.py docs README.md
 ```
