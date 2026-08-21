@@ -1,320 +1,905 @@
-use pyo3::prelude::*;
+//! Reader and patcher for Silkroad Online PK2 archives.
+//!
+//! A PK2 archive is a Blowfish-encrypted index of fixed-size entries laid over
+//! a region of plain, uncompressed file payloads. The on-disk layout this crate
+//! implements is documented in `docs/file-format.md`; the cipher and its key
+//! derivation in `docs/encryption.md`.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), pk2::Error> {
+//! let archive = pk2::Extractor::open("Media.pk2")?;
+//!
+//! for entry in archive.list("server_dep/silkroad/textdata")? {
+//!     println!("{}", entry);
+//! }
+//!
+//! let _bytes = archive.extract("server_dep/silkroad/textdata/weapon.txt")?;
+//! # Ok(())
+//! # }
+//! ```
 
-use bytes::{Buf, BufMut};
-use std::iter::Iterator;
-use std::fs::OpenOptions;
-use std::io::{self, 
-    Read, BufReader, 
-    Write, BufWriter, 
-    Seek, SeekFrom, 
-};
-
+use std::collections::HashSet;
+use std::convert::TryInto;
+use std::error;
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 mod blowfish;
+
 use crate::blowfish::BlowFish;
 
-#[pymodule]
-fn pk2(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<Entry>().unwrap();
-    m.add_class::<Extractor>().unwrap();
-    Ok(())
+// ---------------------------------------------------------------------------
+// Format constants. See docs/file-format.md §9.
+// ---------------------------------------------------------------------------
+
+/// Size of the archive header. The root block begins immediately after it.
+const HEADER_SIZE: u64 = 256;
+/// Offset of the first block of the root chain.
+const ROOT_BLOCK_OFFSET: u64 = HEADER_SIZE;
+/// Every entry occupies exactly 128 bytes.
+const ENTRY_SIZE: usize = 128;
+/// Every block holds exactly 20 entries, no more and no fewer.
+const BLOCK_ENTRY_COUNT: usize = 20;
+/// 20 × 128 = 2560 bytes.
+const BLOCK_SIZE: usize = ENTRY_SIZE * BLOCK_ENTRY_COUNT;
+/// Width of an entry's name field, including its NUL terminator.
+const NAME_BYTES: usize = 81;
+
+// Field offsets within a 128-byte entry.
+const OFF_NAME: usize = 0x01;
+const OFF_ACCESS: usize = 0x52;
+const OFF_CREATE: usize = 0x5A;
+const OFF_MODIFY: usize = 0x62;
+const OFF_POSITION: usize = 0x6A;
+const OFF_SIZE: usize = 0x72;
+const OFF_NEXT_BLOCK: usize = 0x76;
+const OFF_PADDING: usize = 0x7E;
+
+/// Blowfish key for international Silkroad archives.
+///
+/// This is the ASCII key `169841` *after* PK2's salt-XOR derivation. Archives
+/// packed with any other key will not decrypt; see `docs/encryption.md`.
+const DEFAULT_KEY: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Anything that can go wrong reading or modifying an archive.
+#[derive(Debug)]
+pub enum Error {
+    /// The underlying file could not be read or written.
+    Io(io::Error),
+    /// An entry's type byte was outside `0..=2`.
+    ///
+    /// Almost always means the block did not decrypt correctly — typically a
+    /// wrong key, or a chain pointer leading into a file payload.
+    InvalidEntryKind(u8),
+    /// A directory's block chain led back to a block already visited.
+    ChainCycle(u64),
+    /// No entry of that name exists.
+    NotFound(String),
+    /// A path component that must be a directory is not one.
+    NotADirectory(String),
+    /// A path that must name a file does not.
+    NotAFile(String),
+    /// A payload longer than `u32::MAX`, which the `size` field cannot express.
+    FileTooLarge(usize),
 }
 
+/// Shorthand for this crate's result type.
+pub type Result<T> = std::result::Result<T, Error>;
 
-const ENTRY_SIZE: u64 = 128;
-const SKIP_HEADER_SIZE: u64 = 256;
-const PK2_KEYS: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
-const DIRECTORY: u8 = 1;
-const FILE: u8 = 2;
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Io(inner) => write!(f, "i/o error: {}", inner),
+            Error::InvalidEntryKind(byte) => write!(
+                f,
+                "invalid entry type {:#04x}: the archive is corrupt or packed with a different key",
+                byte
+            ),
+            Error::ChainCycle(offset) => {
+                write!(f, "block chain loops back to offset {:#x}", offset)
+            }
+            Error::NotFound(name) => write!(f, "no such entry: {}", name),
+            Error::NotADirectory(name) => write!(f, "not a directory: {}", name),
+            Error::NotAFile(name) => write!(f, "not a file: {}", name),
+            Error::FileTooLarge(len) => write!(
+                f,
+                "payload of {} bytes exceeds the 4 GiB maximum the size field can express",
+                len
+            ),
+        }
+    }
+}
 
-/**
- * Entries should be of Size 128 Byte.
- */
-#[pyclass]
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Error::Io(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(inner: io::Error) -> Self {
+        Error::Io(inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
+
+/// What an [`Entry`] describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    /// An unused slot.
+    ///
+    /// Empty entries are not inert: the `next_block` field of an empty entry is
+    /// still live, so a partially-filled block can chain onward.
+    Empty,
+    /// A directory. Its `position` is the head of its children's block chain.
+    Directory,
+    /// A file. Its `position` and `size` describe the payload.
+    File,
+}
+
+impl EntryKind {
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            0 => Ok(EntryKind::Empty),
+            1 => Ok(EntryKind::Directory),
+            2 => Ok(EntryKind::File),
+            other => Err(Error::InvalidEntryKind(other)),
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            EntryKind::Empty => 0,
+            EntryKind::Directory => 1,
+            EntryKind::File => 2,
+        }
+    }
+}
+
+/// One 128-byte index entry.
 #[derive(Clone, Copy)]
-struct Entry {
-
-    #[pyo3(get)]
-    offset: u64,            // for use in code, not saved in data
-
-    #[pyo3(get)]
-    entry_type: u8,         // 1 Byte;
-
-    name: [u8; 81],         // 81 Byte;
-    
-    access_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
-    create_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
-    modify_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
-    
-    // IF it's a file, this specifies the starting address of the file
-    // IF it's a dir, it points to the first entry in that dir
-    #[pyo3(get)]
-    position: u64,          // 8 Byte;
-
-    // IF it's a file, then this is its size
-    #[pyo3(get)]
-    size: u32,              // 4 Byte;
-
-    // This specifies the offset of the next entry in the same level(directory for example)
-    // if '0' means our next entry is directly below us.
-    #[pyo3(get)]
-    next_chain: u64,        // 8 Byte;
-
-    // Just to make it 128 Byte.
-    padding: u16            // 2 Byte, unused
-}
-
-#[pymethods]
-impl Entry {
-    #[getter]
-    fn name(&self) -> String {
-        let name: Vec<u8> = self.name.iter().filter(|chr| chr > &&0).map(|x| *x).collect();
-        String::from_utf8(name).unwrap_or(String::from("Couldn't"))
-    }
-
-    fn to_string(&self) -> String {
-        format!("Entry<type: {}, name: {}, position: {}, size: {}, next_chain: {}>",
-                    self.entry_type, self.name(), self.position, self.size, self.next_chain)
-    }
+pub struct Entry {
+    /// Where this entry lives in the archive. Derived, not stored on disk.
+    offset: u64,
+    kind: EntryKind,
+    name: [u8; NAME_BYTES],
+    access_date: u64,
+    create_date: u64,
+    modify_date: u64,
+    position: u64,
+    size: u32,
+    next_block: u64,
+    /// Preserved verbatim so rewriting an entry is byte-faithful.
+    padding: [u8; 2],
 }
 
 impl Entry {
-    fn from_bytes(mut buffer: &[u8]) -> Self {
-        let entry_type = buffer.get_u8();
-        let mut name = [0; 81];
-        buffer.copy_to_slice(&mut name);
-        Self {
-            offset: 0,
-            entry_type,
+    /// Offset of this entry within the archive.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether this entry is a file, a directory, or an unused slot.
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    /// The entry's name, decoded lossily.
+    ///
+    /// Original Joymax archives store names in EUC-KR, which this does not yet
+    /// decode; non-ASCII names come back with replacement characters.
+    pub fn name(&self) -> String {
+        String::from_utf8_lossy(self.raw_name()).into_owned()
+    }
+
+    /// For a file, the offset of its payload. For a directory, the head of its
+    /// children's block chain.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Payload length in bytes. Meaningful for files only.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// The next block in this entry's chain, or zero at the end of it.
+    ///
+    /// Only meaningful for the last entry of a block.
+    pub fn next_block(&self) -> u64 {
+        self.next_block
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.kind == EntryKind::File
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.kind == EntryKind::Directory
+    }
+
+    /// The name field up to its first NUL, undecoded.
+    fn raw_name(&self) -> &[u8] {
+        let end = self
+            .name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(NAME_BYTES);
+        &self.name[..end]
+    }
+
+    /// Whether this is a `.` or `..` link rather than real content.
+    fn is_self_or_parent(&self) -> bool {
+        let name = self.raw_name();
+        name == &b"."[..] || name == &b".."[..]
+    }
+
+    fn from_bytes(raw: &[u8], offset: u64) -> Result<Self> {
+        debug_assert_eq!(raw.len(), ENTRY_SIZE, "entries are always 128 bytes");
+
+        let mut name = [0u8; NAME_BYTES];
+        name.copy_from_slice(&raw[OFF_NAME..OFF_NAME + NAME_BYTES]);
+
+        Ok(Self {
+            offset,
+            kind: EntryKind::from_byte(raw[0])?,
             name,
-            access_date: buffer.get_u64_le(),
-            create_date: buffer.get_u64_le(),
-            modify_date: buffer.get_u64_le(),
-            position: buffer.get_u64_le(),
-            size: buffer.get_u32_le(),
-            next_chain: buffer.get_u64_le(),
-            padding: buffer.get_u16()
-        }
+            access_date: read_u64(raw, OFF_ACCESS),
+            create_date: read_u64(raw, OFF_CREATE),
+            modify_date: read_u64(raw, OFF_MODIFY),
+            position: read_u64(raw, OFF_POSITION),
+            size: read_u32(raw, OFF_SIZE),
+            next_block: read_u64(raw, OFF_NEXT_BLOCK),
+            padding: [raw[OFF_PADDING], raw[OFF_PADDING + 1]],
+        })
     }
 
-    fn into_bytes(&self) -> Vec<u8> {
-        let mut buffer: Vec<u8> = Vec::with_capacity(ENTRY_SIZE as usize);
-        
-        buffer.put_u8(self.entry_type);
-        buffer.write(&self.name).unwrap();
-        buffer.put_u64_le(self.access_date);
-        buffer.put_u64_le(self.create_date);
-        buffer.put_u64_le(self.modify_date);
-        buffer.put_u64_le(self.position);
-        buffer.put_u32_le(self.size);
-        buffer.put_u64_le(self.next_chain);
-        buffer.put_u16(self.padding);
-        buffer
+    fn to_bytes(self) -> Vec<u8> {
+        let mut raw = vec![0u8; ENTRY_SIZE];
+        raw[0] = self.kind.to_byte();
+        raw[OFF_NAME..OFF_NAME + NAME_BYTES].copy_from_slice(&self.name);
+        raw[OFF_ACCESS..OFF_ACCESS + 8].copy_from_slice(&self.access_date.to_le_bytes());
+        raw[OFF_CREATE..OFF_CREATE + 8].copy_from_slice(&self.create_date.to_le_bytes());
+        raw[OFF_MODIFY..OFF_MODIFY + 8].copy_from_slice(&self.modify_date.to_le_bytes());
+        raw[OFF_POSITION..OFF_POSITION + 8].copy_from_slice(&self.position.to_le_bytes());
+        raw[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&self.size.to_le_bytes());
+        raw[OFF_NEXT_BLOCK..OFF_NEXT_BLOCK + 8].copy_from_slice(&self.next_block.to_le_bytes());
+        raw[OFF_PADDING..OFF_PADDING + 2].copy_from_slice(&self.padding);
+        raw
     }
 }
 
-#[pyclass]
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("kind", &self.kind)
+            .field("name", &self.name())
+            .field("offset", &self.offset)
+            .field("position", &self.position)
+            .field("size", &self.size)
+            .field("next_block", &self.next_block)
+            .finish()
+    }
+}
+
+impl fmt::Display for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.kind {
+            EntryKind::Directory => write!(f, "{}/", self.name()),
+            EntryKind::File => write!(f, "{} ({} bytes)", self.name(), self.size),
+            EntryKind::Empty => write!(f, "<empty>"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archive
+// ---------------------------------------------------------------------------
+
+/// An open PK2 archive.
 pub struct Extractor {
-    pk2_path: String,
+    path: PathBuf,
     blowfish: BlowFish,
-    root: Option<Entry>,
+    root: Entry,
 }
 
-#[pymethods]
 impl Extractor {
-    #[new]
-    pub fn new(pk2_path: Option<&str>) -> PyResult<Self> {
-        let mut extractor = Self {
-            pk2_path: pk2_path.unwrap().to_string(),
-            blowfish: BlowFish::new(PK2_KEYS, 0, 6),
-            root: None
-        };
+    /// Open an archive.
+    ///
+    /// Reads the root entry immediately, so a missing file or an undecryptable
+    /// index fails here rather than on first use.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let blowfish = BlowFish::new(DEFAULT_KEY);
+        let root = read_entry_at(&path, &blowfish, ROOT_BLOCK_OFFSET)?;
 
-        extractor.root = extractor.get_entry_at_offset(SKIP_HEADER_SIZE); 
-        Ok(extractor)
+        Ok(Self {
+            path,
+            blowfish,
+            root,
+        })
     }
 
-    fn list(&self, directory: Option<&str>) -> Vec<Entry>
-    {
-        let directory = directory.expect("Invalid Directory.");
-        let path_node = if directory.eq_ignore_ascii_case(".") { 
-            self.root 
-        } else { 
-            self.get_entry_of_path(directory)
-        };
-
-        self.get_children_of_node(&path_node.unwrap())
+    /// The root directory entry.
+    pub fn root(&self) -> &Entry {
+        &self.root
     }
 
-    fn extract(&self, path: Option<&str>) -> PyResult<(Entry, Vec<u8>)> {
-        let path = path.expect("Invalid Path.");
-        let entry = self.get_entry_of_path(path).unwrap();
-        let bytes = self.read_bytes(entry.position, entry.size).unwrap();
-        Ok((entry, bytes))
+    /// Resolve a slash-separated path to its entry.
+    ///
+    /// `.` and an empty path both mean the root. `..` ascends, clamped at the
+    /// root. Matching is case-insensitive, as the format's own tools are.
+    pub fn entry(&self, path: &str) -> Result<Entry> {
+        let mut stack = vec![self.root];
+
+        for component in split_path(path) {
+            if component == ".." {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            let current = *stack.last().expect("stack always holds the root");
+            stack.push(self.child_named(&current, component)?);
+        }
+
+        Ok(*stack.last().expect("stack always holds the root"))
     }
 
-    fn patch(&self, path: &str, buffer: &[u8]) -> PyResult<()> {
-        // Get the entry, if doesn't exist will panic!
-        let mut entry = self.get_entry_of_path(path).unwrap();
+    /// List a directory's contents.
+    ///
+    /// `.` and `..` are omitted. Walks the directory's whole block chain, so
+    /// directories larger than one block are returned in full.
+    pub fn list(&self, path: &str) -> Result<Vec<Entry>> {
+        let entry = self.entry(path)?;
+        if !entry.is_directory() {
+            return Err(Error::NotADirectory(path.to_string()));
+        }
+        self.children(&entry)
+    }
 
-        // we have the entry now so we will write the buffer
-        // first to get the offset where it got written
-        // we appended buffer at the end of the file
-        // and ignored the actual old file, it still exists but we cant get it
-        let offset = self.append_bytes(buffer).unwrap();
+    /// Read a file's payload.
+    pub fn extract(&self, path: &str) -> Result<Vec<u8>> {
+        let entry = self.entry(path)?;
+        if !entry.is_file() {
+            return Err(Error::NotAFile(path.to_string()));
+        }
+        Ok(read_at(&self.path, entry.position, entry.size as usize)?)
+    }
 
-        // now we will update our existing entry 
-        // with the new size and position(which is it's new location)
-        entry.position = offset;
-        entry.size = buffer.len() as u32;
-        let encrypted = self.blowfish.encrypt(&entry.into_bytes(), 128);
-        self.write_bytes(entry.offset, &encrypted).expect(
-            "Couldn't write updated entry.");
+    /// Replace a file's contents.
+    ///
+    /// The new payload is appended at the end of the archive and the entry is
+    /// repointed at it. The previous payload is left in place, unreachable —
+    /// the format has no free list, so patching always grows the file. Use a
+    /// repack to reclaim the space.
+    pub fn patch(&self, path: &str, data: &[u8]) -> Result<()> {
+        if data.len() > u32::MAX as usize {
+            return Err(Error::FileTooLarge(data.len()));
+        }
+
+        let mut entry = self.entry(path)?;
+        if !entry.is_file() {
+            return Err(Error::NotAFile(path.to_string()));
+        }
+
+        entry.position = append(&self.path, data)?;
+        entry.size = data.len() as u32;
+
+        let mut encoded = entry.to_bytes();
+        self.blowfish.encrypt(&mut encoded);
+        write_at(&self.path, entry.offset, &encoded)?;
+
         Ok(())
     }
 
+    /// Every child of `entry`, walking its entire block chain.
+    ///
+    /// Returns an empty vector for anything that is not a directory. `.` and
+    /// `..` are omitted.
+    fn children(&self, entry: &Entry) -> Result<Vec<Entry>> {
+        if !entry.is_directory() {
+            return Ok(Vec::new());
+        }
+
+        let mut children = Vec::new();
+        let mut visited = HashSet::new();
+        let mut block_offset = entry.position;
+
+        while block_offset != 0 {
+            if !visited.insert(block_offset) {
+                return Err(Error::ChainCycle(block_offset));
+            }
+
+            let block = self.read_block(block_offset)?;
+
+            children.extend(
+                block
+                    .iter()
+                    .filter(|entry| entry.kind != EntryKind::Empty && !entry.is_self_or_parent())
+                    .copied(),
+            );
+
+            // Only the final entry of a block carries the chain pointer, and it
+            // stays valid even when that entry is itself empty. Empty slots
+            // earlier in the block are holes to skip, not end-of-directory.
+            block_offset = block[BLOCK_ENTRY_COUNT - 1].next_block;
+        }
+
+        Ok(children)
+    }
+
+    fn child_named(&self, directory: &Entry, name: &str) -> Result<Entry> {
+        if !directory.is_directory() {
+            return Err(Error::NotADirectory(directory.name()));
+        }
+
+        self.children(directory)?
+            .into_iter()
+            .find(|child| child.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::NotFound(name.to_string()))
+    }
+
+    fn read_block(&self, offset: u64) -> Result<Vec<Entry>> {
+        read_block_at(&self.path, &self.blowfish, offset)
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Reading and writing
+// ---------------------------------------------------------------------------
 
-impl Extractor {
-    fn get_entry_of_path(&self, path: &str) -> Option<Entry> {
-        let path_parts = self.split_path(path);
+/// Read and decrypt the 20 entries of the block at `offset`.
+fn read_block_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Vec<Entry>> {
+    let mut raw = read_at(path, offset, BLOCK_SIZE)?;
+    blowfish.decrypt(&mut raw);
 
-        let mut graph_path: Vec<Entry> = Vec::new();
-        graph_path.push(self.root.unwrap());
-        for part in path_parts.iter() {
-            graph_path.push(self.get_entry_of_part(part, &graph_path.last().unwrap()).unwrap());
-        }
-
-        graph_path.last().map(|entry| *entry)
-    }
-
-    fn get_entry_of_part(&self, path: &str, cursor: &Entry) -> Option<Entry> {
-        if cursor.entry_type == FILE {
-            panic!("Files can't have children, hence can't be searched in.");
-        }
-
-        let children = self.get_children_of_node(&cursor);
-        for child in children.into_iter() {
-            if child.name()[..].eq_ignore_ascii_case(path) {
-                return Some(child);
-            }
-        }
-        panic!(format!("Can't find specified path: {}.", path));
-    }
-
-    fn get_children_of_node(&self, entry: &Entry) -> Vec<Entry> {
-        if entry.entry_type != DIRECTORY {
-            return vec![];
-        }
-        let mut children: Vec<Entry> = Vec::new();
-        let mut current_index = entry.position + 128;
-
-        loop {
-            let walking_node = self.get_entry_at_offset(current_index).unwrap();
-
-            if walking_node.entry_type > 2 || walking_node.entry_type <= 0 {
-                break;
-            }
-
-            children.push(walking_node);
-
-            if walking_node.next_chain > 0 && walking_node.next_chain != current_index {
-                current_index = walking_node.next_chain;
-            } else {
-                current_index += ENTRY_SIZE;
-            }
-
-            // If at the end of the chain
-            if walking_node.offset + 128 == walking_node.position {
-                break;
-            }
-        }
-
-        children
-    }
-
-    fn get_entry_at_offset(&self, offset: u64) -> Option<Entry> {
-        let bytes = self.read_bytes(offset, ENTRY_SIZE as u32);
-        let decrypted = self.blowfish.decrypt(&bytes.unwrap(), ENTRY_SIZE as u32);
-        let mut entry = Entry::from_bytes(&decrypted);
-        entry.offset = offset;
-        Some(entry)
-    }
-
-    fn read_bytes(&self, offset: u64, count: u32) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; count as usize];
-        let mut reader = BufReader::new(OpenOptions::new().read(true).open(&self.pk2_path)?);
-        reader.seek(SeekFrom::Start(offset.into()))?;
-        reader.read_exact(&mut buffer)?;
-        Ok(buffer)
-    }
-
-    fn append_bytes(&self, buffer: &[u8]) -> io::Result<u64> {
-        let mut writer = BufWriter::new(OpenOptions::new().append(true).open(&self.pk2_path)?);
-        let index = writer.seek(SeekFrom::End(0)).unwrap();
-        writer.write_all(buffer)?;
-        Ok(index)
-    }
-
-    fn write_bytes(&self, offset: u64, buffer: &[u8]) -> io::Result<()> {
-        let mut writer = BufWriter::new(OpenOptions::new().write(true).open(&self.pk2_path)?);
-        writer.seek(SeekFrom::Start(offset.into()))?;
-        writer.write_all(buffer)?;
-        Ok(())
-    }
-
-    fn split_path<'a>(&self, path: &'a str) -> Vec<&'a str> {
-        path.split('/').collect::<Vec<&str>>()
-                        .into_iter()
-                        .filter(|part| part.len() > 0)
-                        .collect()
-    }
+    let (entries, _remainder) = raw.as_chunks::<ENTRY_SIZE>();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| Entry::from_bytes(chunk, offset + (index * ENTRY_SIZE) as u64))
+        .collect()
 }
+
+/// Read and decrypt the single entry at `offset`.
+fn read_entry_at(path: &Path, blowfish: &BlowFish, offset: u64) -> Result<Entry> {
+    let mut raw = read_at(path, offset, ENTRY_SIZE)?;
+    blowfish.decrypt(&mut raw);
+    Entry::from_bytes(&raw, offset)
+}
+
+fn read_at(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; len];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn write_at(path: &Path, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)?;
+    file.flush()
+}
+
+/// Append `data` and return the offset it was written at.
+fn append(path: &Path, data: &[u8]) -> io::Result<u64> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    let offset = file.seek(SeekFrom::End(0))?;
+    file.write_all(data)?;
+    file.flush()?;
+    Ok(offset)
+}
+
+/// Split a path into meaningful components, dropping empties and `.`.
+fn split_path(path: &str) -> impl Iterator<Item = &str> + '_ {
+    path.split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+}
+
+fn read_u64(raw: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes"))
+}
+
+fn read_u32(raw: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(raw[at..at + 4].try_into().expect("4 bytes"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::convert::TryInto;
-    use super::{Entry, Extractor};
-    
-    #[test]
-    fn test_entry_conversion() {
-        let buffer: Vec<u8> = (0..128).map(|i| i as u8 ).collect();
-        let entry = Entry::from_bytes(buffer.as_slice().try_into().unwrap());
-        let back = entry.into_bytes();
+    use super::*;
 
-        assert_eq!(back.len(), 128);
-        for (i, j) in back.iter().zip(buffer.iter()) {
-            assert_eq!(i, j);
+    // Block offsets in the fixtures below.
+    const BLOCK_0: u64 = ROOT_BLOCK_OFFSET;
+    const BLOCK_1: u64 = BLOCK_0 + BLOCK_SIZE as u64;
+    const BLOCK_2: u64 = BLOCK_1 + BLOCK_SIZE as u64;
+    const DATA: u64 = BLOCK_2 + BLOCK_SIZE as u64;
+
+    /// A temporary archive on disk that cleans up after itself.
+    struct TempArchive {
+        path: PathBuf,
+    }
+
+    impl TempArchive {
+        fn new(name: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!("pk2-test-{}.pk2", name));
+            std::fs::write(&path, contents).expect("write the fixture");
+            TempArchive { path }
+        }
+
+        fn open(&self) -> Extractor {
+            Extractor::open(&self.path).expect("open the fixture")
+        }
+    }
+
+    impl Drop for TempArchive {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    // --- fixture builders --------------------------------------------------
+
+    fn raw_entry(kind: u8, name: &str, position: u64, size: u32) -> Vec<u8> {
+        let mut raw = vec![0u8; ENTRY_SIZE];
+        raw[0] = kind;
+
+        let name = name.as_bytes();
+        assert!(name.len() < NAME_BYTES, "name must fit with a terminator");
+        raw[OFF_NAME..OFF_NAME + name.len()].copy_from_slice(name);
+
+        raw[OFF_POSITION..OFF_POSITION + 8].copy_from_slice(&position.to_le_bytes());
+        raw[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&size.to_le_bytes());
+        raw
+    }
+
+    fn dir(name: &str, children_at: u64) -> Vec<u8> {
+        raw_entry(1, name, children_at, 0)
+    }
+
+    fn file(name: &str, at: u64, size: u32) -> Vec<u8> {
+        raw_entry(2, name, at, size)
+    }
+
+    fn hole() -> Vec<u8> {
+        vec![0u8; ENTRY_SIZE]
+    }
+
+    /// Assemble up to 19 entries into one encrypted 2560-byte block.
+    ///
+    /// Entry 19 is deliberately left *empty* while still carrying `next_block`.
+    /// That is legal per the format and is precisely the shape a walker that
+    /// stops at the first empty entry gets wrong.
+    fn block(mut entries: Vec<Vec<u8>>, next_block: u64) -> Vec<u8> {
+        assert!(
+            entries.len() < BLOCK_ENTRY_COUNT,
+            "entry 19 is reserved for the chain pointer"
+        );
+        while entries.len() < BLOCK_ENTRY_COUNT - 1 {
+            entries.push(hole());
+        }
+
+        let mut chain_entry = hole();
+        chain_entry[OFF_NEXT_BLOCK..OFF_NEXT_BLOCK + 8].copy_from_slice(&next_block.to_le_bytes());
+        entries.push(chain_entry);
+
+        let mut raw: Vec<u8> = entries.concat();
+        assert_eq!(raw.len(), BLOCK_SIZE);
+        BlowFish::new(DEFAULT_KEY).encrypt(&mut raw);
+        raw
+    }
+
+    /// An archive whose root directory spans two chained blocks.
+    ///
+    /// ```text
+    ///   root chain:  BLOCK_0 ──▶ BLOCK_1 ──▶ end
+    ///   "sub" chain: BLOCK_2
+    /// ```
+    ///
+    /// `BLOCK_1` holds a hole between real entries, and `BLOCK_0`'s chain
+    /// pointer lives in an empty entry 19.
+    fn chained_archive() -> Vec<u8> {
+        let mut out = vec![0u8; HEADER_SIZE as usize];
+
+        out.extend(block(
+            vec![
+                dir(".", BLOCK_0),
+                dir("..", BLOCK_0),
+                file("alpha.txt", DATA, 5),
+                file("beta.txt", DATA, 5),
+            ],
+            BLOCK_1,
+        ));
+
+        out.extend(block(
+            vec![
+                file("gamma.txt", DATA, 5),
+                hole(), // a gap between real entries
+                dir("sub", BLOCK_2),
+                file("delta.txt", DATA, 5),
+            ],
+            0,
+        ));
+
+        out.extend(block(
+            vec![
+                dir(".", BLOCK_2),
+                dir("..", BLOCK_0),
+                file("inner.txt", DATA, 5),
+            ],
+            0,
+        ));
+
+        out.extend_from_slice(b"hello");
+        out
+    }
+
+    fn names(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(Entry::name).collect()
+    }
+
+    fn sorted_names(entries: &[Entry]) -> Vec<String> {
+        let mut names = names(entries);
+        names.sort();
+        names
+    }
+
+    // --- entry parsing -----------------------------------------------------
+
+    #[test]
+    fn entry_round_trips_through_bytes() {
+        let raw = file("weapon.txt", 0xDEAD, 4096);
+        let entry = Entry::from_bytes(&raw, 0x100).expect("parse");
+
+        assert_eq!(entry.kind(), EntryKind::File);
+        assert_eq!(entry.name(), "weapon.txt");
+        assert_eq!(entry.position(), 0xDEAD);
+        assert_eq!(entry.size(), 4096);
+        assert_eq!(entry.offset(), 0x100);
+        assert_eq!(entry.to_bytes(), raw, "re-encoding must be byte-faithful");
+    }
+
+    #[test]
+    fn rejects_an_unknown_entry_kind() {
+        let mut raw = hole();
+        raw[0] = 9;
+        assert!(matches!(
+            Entry::from_bytes(&raw, 0),
+            Err(Error::InvalidEntryKind(9))
+        ));
+    }
+
+    #[test]
+    fn name_stops_at_the_first_nul() {
+        let mut raw = file("ok.txt", 0, 0);
+        raw[OFF_NAME + 7] = b'X'; // garbage past the terminator
+        assert_eq!(Entry::from_bytes(&raw, 0).expect("parse").name(), "ok.txt");
+    }
+
+    #[test]
+    fn empty_entry_still_exposes_its_chain_pointer() {
+        let mut raw = hole();
+        raw[OFF_NEXT_BLOCK..OFF_NEXT_BLOCK + 8].copy_from_slice(&0x2A00u64.to_le_bytes());
+
+        let entry = Entry::from_bytes(&raw, 0).expect("parse");
+        assert_eq!(entry.kind(), EntryKind::Empty);
+        assert_eq!(entry.next_block(), 0x2A00);
+    }
+
+    // --- directory walking -------------------------------------------------
+
+    #[test]
+    fn lists_every_child_across_a_block_chain() {
+        let archive = TempArchive::new("chain", &chained_archive());
+        assert_eq!(
+            sorted_names(&archive.open().list(".").expect("list root")),
+            vec!["alpha.txt", "beta.txt", "delta.txt", "gamma.txt", "sub"]
+        );
+    }
+
+    #[test]
+    fn follows_next_block_from_an_empty_final_entry() {
+        // "gamma.txt" is in the second block, reachable only by following the
+        // chain pointer held in BLOCK_0's empty entry 19.
+        let archive = TempArchive::new("chainptr", &chained_archive());
+        let listed = names(&archive.open().list(".").expect("list root"));
+        assert!(listed.contains(&"gamma.txt".to_string()));
+    }
+
+    #[test]
+    fn does_not_treat_a_hole_as_end_of_directory() {
+        // "delta.txt" sits after an empty slot inside BLOCK_1.
+        let archive = TempArchive::new("hole", &chained_archive());
+        let listed = names(&archive.open().list(".").expect("list root"));
+        assert!(listed.contains(&"delta.txt".to_string()));
+    }
+
+    #[test]
+    fn omits_self_and_parent_links() {
+        let archive = TempArchive::new("dots", &chained_archive());
+        let listed = names(&archive.open().list(".").expect("list root"));
+        assert!(
+            !listed.iter().any(|name| name == "." || name == ".."),
+            "got {:?}",
+            listed
+        );
+    }
+
+    #[test]
+    fn descends_into_a_subdirectory() {
+        let archive = TempArchive::new("descend", &chained_archive());
+        assert_eq!(
+            names(&archive.open().list("sub").expect("list sub")),
+            vec!["inner.txt"]
+        );
+    }
+
+    #[test]
+    fn detects_a_chain_cycle() {
+        let mut raw = vec![0u8; HEADER_SIZE as usize];
+        raw.extend(block(vec![dir(".", BLOCK_0), dir("..", BLOCK_0)], BLOCK_0));
+
+        let archive = TempArchive::new("cycle", &raw);
+        assert!(matches!(
+            archive.open().list("."),
+            Err(Error::ChainCycle(_))
+        ));
+    }
+
+    // --- path resolution ---------------------------------------------------
+
+    #[test]
+    fn resolves_root_synonyms() {
+        let archive = TempArchive::new("rootnames", &chained_archive());
+        let archive = archive.open();
+
+        let expected = sorted_names(&archive.list(".").expect("dot"));
+        for path in &["", "/", "./", "."] {
+            assert_eq!(sorted_names(&archive.list(path).expect(path)), expected);
         }
     }
 
     #[test]
-    fn test_extract() {
-        let path = "/home/sorcerer/Desktop/Media.pk2";
-        let extractor = Extractor::new(Some(path));
-        let _output = extractor.unwrap().extract(
-            Some("server_dep/silkroad/textdata/siegefortressreward.txt"));
-    }
-
-    #[test]
-    fn test_list() {
-        let path = "/home/sorcerer/Desktop/Media.pk2";
-        let extractor = Extractor::new(Some(path));
-        let _output = extractor.unwrap().list(
-            Some("server_dep/silkroad/"));
-    }
-
-    #[test]
-    fn test_patch() {
-        let path = "/home/sorcerer/Desktop/Media.pk2";
-        let extractor = Extractor::new(Some(path));
-        let _index = extractor.unwrap().patch(
-            "server_dep/silkroad/textdata/siegefortressreward.txt", 
-            &[1,2,3,4,5,6,8,9]
+    fn resolves_parent_components() {
+        let archive = TempArchive::new("dotdot", &chained_archive());
+        assert_eq!(
+            names(&archive.open().list("sub/../sub").expect("list")),
+            vec!["inner.txt"]
         );
     }
 
+    #[test]
+    fn parent_of_root_clamps_at_root() {
+        let archive = TempArchive::new("clamp", &chained_archive());
+        let archive = archive.open();
+        assert_eq!(
+            sorted_names(&archive.list("../../..").expect("list")),
+            sorted_names(&archive.list(".").expect("list"))
+        );
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let archive = TempArchive::new("case", &chained_archive());
+        assert_eq!(
+            names(&archive.open().list("SUB").expect("list")),
+            vec!["inner.txt"]
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_path() {
+        let archive = TempArchive::new("missing", &chained_archive());
+        assert!(matches!(
+            archive.open().list("nope"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_to_list_a_file() {
+        let archive = TempArchive::new("notdir", &chained_archive());
+        assert!(matches!(
+            archive.open().list("alpha.txt"),
+            Err(Error::NotADirectory(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_to_descend_through_a_file() {
+        let archive = TempArchive::new("through", &chained_archive());
+        assert!(matches!(
+            archive.open().list("alpha.txt/deeper"),
+            Err(Error::NotADirectory(_))
+        ));
+    }
+
+    // --- payloads ----------------------------------------------------------
+
+    #[test]
+    fn extracts_file_bytes() {
+        let archive = TempArchive::new("extract", &chained_archive());
+        assert_eq!(
+            archive.open().extract("sub/inner.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn refuses_to_extract_a_directory() {
+        let archive = TempArchive::new("extractdir", &chained_archive());
+        assert!(matches!(
+            archive.open().extract("sub"),
+            Err(Error::NotAFile(_))
+        ));
+    }
+
+    #[test]
+    fn patch_appends_and_repoints_the_entry() {
+        let archive = TempArchive::new("patch", &chained_archive());
+
+        archive
+            .open()
+            .patch("sub/inner.txt", b"replacement")
+            .expect("patch");
+
+        // Re-open so nothing can be served from in-memory state.
+        assert_eq!(
+            archive.open().extract("sub/inner.txt").expect("extract"),
+            b"replacement".to_vec()
+        );
+    }
+
+    #[test]
+    fn patch_leaves_other_entries_alone() {
+        let archive = TempArchive::new("patchother", &chained_archive());
+
+        archive
+            .open()
+            .patch("sub/inner.txt", b"replacement")
+            .expect("patch");
+
+        let reopened = archive.open();
+        assert_eq!(
+            sorted_names(&reopened.list(".").expect("list root")),
+            vec!["alpha.txt", "beta.txt", "delta.txt", "gamma.txt", "sub"]
+        );
+        assert_eq!(
+            reopened.extract("alpha.txt").expect("extract"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn refuses_to_patch_a_directory() {
+        let archive = TempArchive::new("patchdir", &chained_archive());
+        assert!(matches!(
+            archive.open().patch("sub", b"nope"),
+            Err(Error::NotAFile(_))
+        ));
+    }
+
+    #[test]
+    fn opening_a_missing_file_is_an_io_error() {
+        let missing = std::env::temp_dir().join("pk2-test-does-not-exist.pk2");
+        assert!(matches!(Extractor::open(missing), Err(Error::Io(_))));
+    }
 }
-
-

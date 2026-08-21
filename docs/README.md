@@ -28,16 +28,23 @@ fixing them. This list shrinks as work lands.
 
 | Gap | Spec reference |
 |---|---|
-| Directory walk stops at the first `type == 0` entry, truncating chains that continue past a partially-filled block | [§3 Empty entries are not inert](file-format.md#empty-entries-are-not-inert), [§7](file-format.md#7-walking-the-archive) |
-| Directory walk advances by 128 B instead of following `entry[19].next_block`, and can run off a block into payload bytes | [§5](file-format.md#5-block-chains), [§7](file-format.md#7-walking-the-archive) |
-| `.` is skipped by starting at `position + 128`, but `..` is returned as a child | [§4](file-format.md#4-block), [§6](file-format.md#6-how-the-tree-fits-together) |
-| No cycle guard when following chains | [§7](file-format.md#7-walking-the-archive) |
 | Header is never read: no signature check, no version check, no key verification | [§2](file-format.md#2-header) |
-| The derived Blowfish key is hardcoded, so archives packed with any other key fail silently | [encryption.md — Key derivation](encryption.md#key-derivation) |
+| The derived Blowfish key is hardcoded, so archives packed with any other key fail to decrypt | [encryption.md — Key derivation](encryption.md#key-derivation) |
 | Filenames are decoded as UTF-8; original archives use EUC-KR | [§3 Names](file-format.md#names) |
-| `extract` returns a list of ints to Python rather than `bytes` | — |
-| Errors are raised by panicking across the FFI boundary instead of returning `PyErr` | — |
-| Writes are buffered and flushed on drop, discarding I/O errors | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
+| The archive is reopened for every 128-byte read | — |
+| No repack, so payloads orphaned by `patch` are never reclaimed | [§8 Rewriting a file](file-format.md#rewriting-a-file) |
+| `Extractor` also patches, so the name no longer describes the type | — |
+
+### Closed
+
+| Gap | Fixed by |
+|---|---|
+| Directory walk stopped at the first `type == 0` entry, truncating chains | `fix/block-chain-walk` |
+| Directory walk advanced by 128 B instead of following `entry[19].next_block` | `fix/block-chain-walk` |
+| `..` was returned as a child of every directory | `fix/block-chain-walk` |
+| No cycle guard when following chains | `fix/block-chain-walk` |
+| Writes were buffered and flushed on drop, discarding I/O errors | `fix/block-chain-walk` |
+| Failures panicked instead of returning a typed error | `fix/block-chain-walk` |
 
 ## Testing against a real archive
 
