@@ -74,6 +74,28 @@ jobs:
       - name: Clippy without default features
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Proves the rust-version in Cargo.toml rather than trusting it. The
+      # binding constraint is slice::as_chunks, stabilised in 1.88.
+      - name: Install the declared minimum toolchain
+        run: |
+          rustup toolchain install 1.88 --profile minimal --no-self-update
+          rustup default 1.88
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Build without default features
+        run: cargo build --all-targets --no-default-features
+
+      - name: Test
+        run: cargo test --all-targets
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
