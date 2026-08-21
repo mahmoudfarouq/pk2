@@ -19,7 +19,6 @@
 //! ```
 
 use std::collections::HashSet;
-use std::convert::TryInto;
 use std::error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
