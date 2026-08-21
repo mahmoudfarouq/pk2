@@ -27,7 +27,7 @@ jobs:
         # path separators, so all three platforms are worth covering.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -57,7 +57,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
@@ -103,7 +103,7 @@ jobs:
       # Catches broken intra-doc links, which a plain build will not.
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         run: |
