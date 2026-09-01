@@ -78,7 +78,7 @@ jobs:
     name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Proves the rust-version in Cargo.toml rather than trusting it. The
       # binding constraint is slice::as_chunks, stabilised in 1.88.
